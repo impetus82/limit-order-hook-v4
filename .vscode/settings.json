@@ -1,0 +1,19 @@
+{
+  "solidity.compileUsingRemoteVersion": "v0.8.26",
+  "solidity.packageDefaultDependenciesContractsDirectory": "",
+  "solidity.packageDefaultDependenciesDirectory": "lib",
+  "solidity.remappings": [
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/"
+  ],
+  "solidity.formatter": "forge",
+  "[solidity]": {
+    "editor.defaultFormatter": "JuanBlanco.solidity",
+    "editor.formatOnSave": true
+  },
+  "editor.formatOnSave": true,
+  "files.associations": {
+    "*.sol": "solidity"
+  }
+}
