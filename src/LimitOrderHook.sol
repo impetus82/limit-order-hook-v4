@@ -17,7 +17,7 @@ contract LimitOrderHook is BaseHook {
 
     // Storage
     uint256 public orderCount;
-    
+
     // Constructor
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
 
@@ -31,7 +31,7 @@ contract LimitOrderHook is BaseHook {
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
             beforeSwap: false,
-            afterSwap: true,      // ✅ Enabled для limit order execution
+            afterSwap: true, // ✅ Enabled для limit order execution
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: false,
@@ -43,13 +43,11 @@ contract LimitOrderHook is BaseHook {
 
     /// @notice Internal hook called after swap
     /// @dev Override _afterSwap instead of afterSwap (BaseHook pattern)
-    function _afterSwap(
-        address,
-        PoolKey calldata,
-        SwapParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) internal override returns (bytes4, int128) {
+    function _afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
+        internal
+        override
+        returns (bytes4, int128)
+    {
         // TODO: Implement order execution logic on Day 3-4
         return (this.afterSwap.selector, 0);
     }

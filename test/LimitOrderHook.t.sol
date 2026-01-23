@@ -8,7 +8,6 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 /// @notice Simplified tests for Phase 1 MVP - Day 1-2
 /// @dev Hook address validation and integration tests - Day 3-4
 contract LimitOrderHookTest is Test {
-    
     function testHookPermissions() public pure {
         // Test permissions without deploying (avoid address validation for MVP)
         Hooks.Permissions memory perms = Hooks.Permissions({
@@ -27,7 +26,7 @@ contract LimitOrderHookTest is Test {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
-        
+
         // Verify only afterSwap is enabled
         assertTrue(perms.afterSwap, "afterSwap should be enabled");
         assertFalse(perms.beforeSwap, "beforeSwap should be disabled");
