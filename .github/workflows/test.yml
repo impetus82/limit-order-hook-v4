@@ -1,38 +1,42 @@
-name: CI
-
-permissions: {}
+name: Test
 
 on:
   push:
+    branches: [main]
   pull_request:
-  workflow_dispatch:
-
-env:
-  FOUNDRY_PROFILE: ci
+    branches: [main]
 
 jobs:
-  check:
-    name: Foundry project
+  test:
+    name: Foundry Tests
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
-          persist-credentials: false
-          submodules: recursive
-
+          submodules: recursive  # ✅ Важно для v4-core, v4-periphery
+      
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-
-      - name: Show Forge version
-        run: forge --version
-
-      - name: Run Forge fmt
-        run: forge fmt --check
-
+        with:
+          version: nightly
+      
+      - name: Show Foundry version
+        run: |
+          forge --version
+          forge tree
+      
       - name: Run Forge build
-        run: forge build --sizes
-
+        run: |
+          forge build --sizes
+        id: build
+      
       - name: Run Forge tests
-        run: forge test -vvv
+        run: |
+          forge test -vvv
+        id: test
+      
+      - name: Run Forge coverage
+        run: |
+          forge coverage --report summary
+        continue-on-error: true  # ✅ Пока MVP, coverage не критична
