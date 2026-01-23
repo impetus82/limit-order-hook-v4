@@ -9,7 +9,6 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 /// @notice MVP tests for Day 3-4 without pool manager deployment
 /// @dev Testing contract logic directly, pool integration on Day 5-7
 contract LimitOrderHookTest is Test {
-    
     function testHookPermissions() public pure {
         Hooks.Permissions memory perms = Hooks.Permissions({
             beforeInitialize: false,
@@ -19,7 +18,7 @@ contract LimitOrderHookTest is Test {
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
             beforeSwap: false,
-            afterSwap: true,  // Only this enabled
+            afterSwap: true, // Only this enabled
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: false,
@@ -27,7 +26,7 @@ contract LimitOrderHookTest is Test {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
-        
+
         assertTrue(perms.afterSwap, "afterSwap should be enabled");
         assertFalse(perms.beforeSwap, "beforeSwap should be disabled");
     }
@@ -37,7 +36,7 @@ contract LimitOrderHookTest is Test {
         // Including: LimitOrder struct, createLimitOrder, cancelOrder, getters
         assertTrue(true);
     }
-    
+
     function testLimitOrderStructSize() public pure {
         // Verify packed struct fits in 3 slots
         // creator (20) + amount0 (12) = 32 bytes (slot 0)
