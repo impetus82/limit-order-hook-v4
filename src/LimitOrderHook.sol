@@ -7,16 +7,21 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {CurrencyLibrary, Currency} from "v4-core/src/types/Currency.sol";
+
+// SwapParams уже доступен через IPoolManager!
+
 
 /// @title LimitOrderHook
-/// @notice Gas-efficient limit orders for Uniswap V4 using packed storage
-/// @dev Phase 1: Day 5-7 - Order execution logic implemented
-contract LimitOrderHook is BaseHook {
+/// @notice Gas-efficient limit orders for Uniswap V4 with real token transfers
+/// @dev Phase 2.1: Day 8-10 - Token transfers via IUnlockCallback implemented
+contract LimitOrderHook is BaseHook, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
+    using CurrencyLibrary for Currency;
 
     /*//////////////////////////////////////////////////////////////
                             CUSTOM ERRORS
@@ -27,6 +32,7 @@ contract LimitOrderHook is BaseHook {
     error UnauthorizedCancellation();
     error OrderAlreadyFilled();
     error InvalidTriggerPrice();
+    error Unauthorized();
 
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
@@ -59,6 +65,12 @@ contract LimitOrderHook is BaseHook {
     /// @notice Next order ID counter
     uint256 public nextOrderId;
 
+    /// @notice Configuration
+    uint256 public constant MIN_ORDER_SIZE = 0.01 ether; // $100 at $10k ETH
+    uint256 public feePercentage = 5; // 0.05% = 5 basis points
+    uint256 public collectedFees;
+    address public owner;
+
     /*//////////////////////////////////////////////////////////////
                             EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -88,7 +100,14 @@ contract LimitOrderHook is BaseHook {
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
     
-    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
+    /// @notice Initialize the hook with PoolManager reference
+    /// @param _poolManager The Uniswap V4 PoolManager contract
+    constructor(IPoolManager _poolManager) 
+        BaseHook(_poolManager)
+    {
+        owner = msg.sender;
+    }
+
 
     /*//////////////////////////////////////////////////////////////
                         HOOK PERMISSIONS
@@ -183,6 +202,9 @@ contract LimitOrderHook is BaseHook {
             zeroForOne ? 0 : amountIn, 
             triggerPrice
         );
+
+        // NOTE: Token transfer logic will be added in Phase 2.2
+        // For MVP, assume user has approved tokens
     }
 
     /// @notice Cancel an existing limit order
@@ -211,6 +233,8 @@ contract LimitOrderHook is BaseHook {
         delete orders[orderId];
 
         emit OrderCancelled(orderId, msg.sender);
+
+        // NOTE: Token refund logic will be added in Phase 2.2
     }
 
     /// @notice Get order details
@@ -228,7 +252,7 @@ contract LimitOrderHook is BaseHook {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        EXECUTION LOGIC (DAY 5-7)
+                        EXECUTION LOGIC (DAY 5-7 + 8-10)
     //////////////////////////////////////////////////////////////*/
     
     /// @notice Internal hook called after every swap
@@ -237,12 +261,12 @@ contract LimitOrderHook is BaseHook {
     function _afterSwap(
         address,
         PoolKey calldata poolKey,
-        SwapParams calldata,
+        IPoolManager.SwapParams calldata,  // ✅ Полное имя
         BalanceDelta,
         bytes calldata
     ) internal override returns (bytes4, int128) {
         // PHASE 1: Get current pool price
-        (uint160 sqrtPriceX96,,, ) = poolManager.getSlot0(poolKey.toId());
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
         uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
         
         // PHASE 2 & 3: Match and execute eligible orders
@@ -259,28 +283,16 @@ contract LimitOrderHook is BaseHook {
         // Step 1: Convert sqrtPriceX96 to uint256 for safe math
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         
-        // Step 2: Divide by 2^96 to get sqrt(P)
-        // sqrtPrice / 2^96 = sqrtPrice >> 96
-        uint256 sqrtP = sqrtPrice;
+        // Step 2: Square and divide by 2^96 (first division)
+        uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
         
-        // Step 3: Square to get P, then scale to 1e18
-        // P = (sqrtPrice / 2^96)^2
-        // To avoid overflow: (sqrtPrice^2) / (2^192) * 1e18
-        // Rewrite as: (sqrtPrice^2 * 1e18) / 2^192
-        // But 2^192 is too large, so we do: (sqrtPrice * 1e18 / 2^96)^2 / 2^96
+        // Step 3: Scale to 1e18 and divide by 2^96 again (second division)
+        uint256 priceScaled = (priceX96 * 1e18) / (1 << 96);
         
-        // Simplified approach: sqrtPrice * sqrtPrice / 2^96 * 1e18 / 2^96
-        // = sqrtPrice^2 * 1e18 / 2^192
-        // Split division to avoid overflow
-        uint256 priceX96 = (sqrtP * sqrtP) / (1 << 96); // Divide by 2^96 once
-        uint256 priceScaled = (priceX96 * 1e18) / (1 << 96); // Divide by 2^96 again, scale to 1e18
-        
-        // Step 4: Cast to uint128 (safe because price won't exceed uint128 range)
+        // Step 4: Cast to uint128 (safe for realistic prices)
         // casting to 'uint128' is safe because priceScaled is result of division
-        // and will never exceed uint128 max value in realistic price ranges
         // forge-lint: disable-next-line(unsafe-typecast)
         price = uint128(priceScaled);
-
     }
 
     /// @notice Match and execute eligible limit orders for the pool
@@ -290,7 +302,7 @@ contract LimitOrderHook is BaseHook {
     function _matchOrders(PoolKey calldata poolKey, uint128 currentPrice) internal {
         address token0 = Currency.unwrap(poolKey.currency0);
         
-        // Loop through all orders (MVP: O(n) - optimize in Phase 2 with buckets)
+        // Loop through all orders (MVP: O(n) - optimize in Phase 2.3 with buckets)
         for (uint256 i = 0; i < nextOrderId; i++) {
             LimitOrder storage order = orders[i];
             
@@ -302,7 +314,7 @@ contract LimitOrderHook is BaseHook {
             
             // Check if order is eligible for execution
             if (_isEligible(order, currentPrice)) {
-                _executeOrder(i, currentPrice);
+                _executeOrder(i, poolKey, currentPrice);
             }
         }
     }
@@ -327,24 +339,26 @@ contract LimitOrderHook is BaseHook {
         }
     }
 
-    /// @notice Execute a limit order
+    /// @notice Execute a limit order with real token transfers
     /// @param orderId The ID of the order to execute
+    /// @param poolKey The pool key
     /// @param executionPrice The price at which the order is executed
-    /// @dev Marks order as filled and emits event
-    /// @dev TODO Phase 2: Implement actual token transfers via PoolManager.take()/settle()
-    function _executeOrder(uint256 orderId, uint128 executionPrice) internal {
+    /// @dev Marks order as filled BEFORE unlock (prevents reentrancy)
+    /// @dev Calls poolManager.unlock() which triggers unlockCallback()
+    function _executeOrder(
+        uint256 orderId, 
+        PoolKey calldata poolKey, 
+        uint128 executionPrice
+    ) internal {
         LimitOrder storage order = orders[orderId];
         
-        // Mark as filled (prevents double execution)
+        // Mark as filled BEFORE unlock (reentrancy protection)
         order.isFilled = true;
-        
-        // TODO Phase 2: Implement token transfers
-        // For MVP, we just mark as filled and emit event
-        // Production implementation would do:
-        // 1. poolManager.unlock() to enable transfers
-        // 2. poolManager.take() to withdraw tokens from pool
-        // 3. poolManager.settle() to deposit tokens to pool
-        // 4. Transfer output tokens to order.creator
+
+        // ✅ PHASE 2.1: Call unlock for token transfers
+        // This will invoke unlockCallback() below
+        bytes memory data = abi.encode(orderId, poolKey);
+        poolManager.unlock(data);
         
         emit OrderFilled(
             orderId,
@@ -353,5 +367,58 @@ contract LimitOrderHook is BaseHook {
             order.zeroForOne ? order.amount1 : order.amount0,
             executionPrice
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                IUNLOCKCALLBACK 
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Callback for PoolManager.unlock() to execute token transfers
+    /// @dev This function is called by PoolManager when unlock() is invoked
+    function unlockCallback(bytes calldata data) 
+        external 
+        override
+        returns (bytes memory) 
+    {
+        // Decode callback data
+        (uint256 orderId, PoolKey memory poolKey) = abi.decode(data, (uint256, PoolKey));
+        LimitOrder storage order = orders[orderId];
+
+        if (order.zeroForOne) {
+            poolManager.take(
+                poolKey.currency1,
+                order.creator,
+                uint256(order.amount1)
+            );
+        } else {
+            poolManager.take(
+                poolKey.currency0,
+                order.creator,
+                uint256(order.amount0)
+            );
+        }
+
+        return "";
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        ADMIN FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+    
+    /// @notice Set fee percentage (only owner)
+    /// @param newFee New fee in basis points (5 = 0.05%)
+    function setFeePercentage(uint256 newFee) external {
+        if (msg.sender != owner) revert Unauthorized();
+        require(newFee <= 50, "Fee too high"); // Max 0.5%
+        feePercentage = newFee;
+    }
+
+    /// @notice Withdraw collected fees (only owner)
+    /// @param recipient Address to receive fees
+    function withdrawFees(address payable recipient) external {
+        if (msg.sender != owner) revert Unauthorized();
+        uint256 amount = collectedFees;
+        collectedFees = 0;
+        recipient.transfer(amount);
     }
 }
