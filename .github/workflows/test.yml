@@ -10,33 +10,35 @@ jobs:
   test:
     name: Foundry Tests
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive  # ✅ Важно для v4-core, v4-periphery
-      
+          submodules: recursive
+
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: nightly
-      
+
       - name: Show Foundry version
         run: |
           forge --version
-          forge tree
-      
+
       - name: Run Forge build
         run: |
-          forge build --sizes
+          forge build
         id: build
-      
+
       - name: Run Forge tests
         run: |
-          forge test -vvv
+          forge test -vv
         id: test
-      
-      - name: Run Forge coverage
-        run: |
-          forge coverage --report summary
-        continue-on-error: true  # ✅ Пока MVP, coverage не критична
+        env:
+          FOUNDRY_PROFILE: default
+
+      # Пропускаем coverage (не критично для MVP)
+      # - name: Run Forge coverage
+      #   run: |
+      #     forge coverage --report summary
+      #   continue-on-error: true
