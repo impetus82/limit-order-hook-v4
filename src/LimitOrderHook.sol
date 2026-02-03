@@ -10,10 +10,10 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {console2} from "forge-std/console2.sol";
 
 /// @title LimitOrderHook
 /// @notice Gas-efficient limit orders for Uniswap V4 with real token transfers
@@ -59,6 +59,8 @@ contract LimitOrderHook is BaseHook {
     mapping(uint256 => LimitOrder) public orders;
     mapping(address => uint256[]) private userOrders;
     uint256 public nextOrderId;
+    /// @notice Tick-based order indexing for O(1) lookup
+    mapping(int24 => uint256[]) public tickToOrders;
     
     /// @dev Reentrancy guard for execution
     bool private isExecuting;
@@ -186,6 +188,11 @@ contract LimitOrderHook is BaseHook {
 
         userOrders[msg.sender].push(orderId);
 
+        // Add to tick bucket for O(1) lookup
+        uint160 sqrtPriceX96 = uint128ToSqrtPrice(triggerPrice);
+        int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+        tickToOrders[tick].push(orderId);
+
         emit OrderCreated(
             orderId, 
             msg.sender, 
@@ -267,35 +274,23 @@ contract LimitOrderHook is BaseHook {
     ) internal returns (bool executed, int128 delta0, int128 delta1) {
         address token0 = Currency.unwrap(poolKey.currency0);
         
-        console2.log("=== TRYING TO EXECUTE ORDERS ===");
-        console2.log("User swap direction (zeroForOne):", userSwapDirection);
-        console2.log("Current price:", currentPrice);
-        
         for (uint256 i = 0; i < nextOrderId; i++) {
             LimitOrder storage order = orders[i];
             
             if (order.creator == address(0) || order.isFilled) continue;
             if (order.token0 != token0) continue;
             
-            console2.log("\n--- Order", i, "---");
-            console2.log("Order direction (zeroForOne):", order.zeroForOne);
-            console2.log("Trigger price:", order.triggerPrice);
-            
             // Check price trigger
             if (!_isEligible(order, currentPrice)) {
-                console2.log("SKIP: Price not eligible");
                 continue;
             }
             
-            console2.log("Price is eligible!");
-            
+          
             // Execute only if direction is opposite to user swap
             // if (order.zeroForOne == userSwapDirection) {
                 // console2.log("SKIP: Same direction as user swap (would compete for liquidity)");
                 // continue;
             // }
-            
-            console2.log("Direction is opposite - EXECUTING!");
             
             // Execute order
             (int128 d0, int128 d1) = _executeOrderInBeforeSwap(i, poolKey, currentPrice);
@@ -308,7 +303,6 @@ contract LimitOrderHook is BaseHook {
         }
         
         if (!executed) {
-            console2.log("\nNO ORDERS EXECUTED");
         }
     }
 
@@ -432,6 +426,32 @@ contract LimitOrderHook is BaseHook {
         } else {
             eligible = currentPrice <= order.triggerPrice;
         }
+    }
+
+    /// @notice Convert price to sqrtPriceX96 format
+    function uint128ToSqrtPrice(uint128 price) public pure returns (uint160) {
+        // price = (sqrtPriceX96^2) / 2^192
+        // Therefore: sqrtPriceX96 = sqrt(price * 2^192)
+        uint256 priceX96 = (uint256(price) * (1 << 96)) / 1e18;
+        uint256 sqrtPriceSquared = priceX96 * (1 << 96);
+        return uint160(sqrt(sqrtPriceSquared));
+    }
+
+    /// @notice Integer square root using Babylonian method
+    function sqrt(uint256 x) internal pure returns (uint256) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        uint256 y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+        return y;
+    }
+
+    /// @notice Get all orders in a specific tick bucket
+    function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
+        return tickToOrders[tick];
     }
 
     /*//////////////////////////////////////////////////////////////
