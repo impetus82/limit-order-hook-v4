@@ -61,6 +61,7 @@ contract LimitOrderHook is BaseHook {
     uint256 public nextOrderId;
     /// @notice Tick-based order indexing for O(1) lookup
     mapping(int24 => uint256[]) public tickToOrders;
+    mapping(uint256 => int24) private orderTickBucket;
     
     /// @dev Reentrancy guard for execution
     bool private isExecuting;
@@ -69,6 +70,9 @@ contract LimitOrderHook is BaseHook {
     uint256 public feePercentage = 5;
     uint256 public collectedFees;
     address public owner;
+
+    /// @notice Range width for tick checking (±N ticks around current)
+    int24 public constant TICK_RANGE_WIDTH = 2;
 
     /*//////////////////////////////////////////////////////////////
                             EVENTS
@@ -190,8 +194,10 @@ contract LimitOrderHook is BaseHook {
 
         // Add to tick bucket for O(1) lookup
         uint160 sqrtPriceX96 = uint128ToSqrtPrice(triggerPrice);
-        int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+        int24 rawTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+        int24 tick = _alignTick(rawTick, poolKey.tickSpacing);
         tickToOrders[tick].push(orderId);
+        orderTickBucket[orderId] = tick;
 
         emit OrderCreated(
             orderId, 
@@ -202,22 +208,35 @@ contract LimitOrderHook is BaseHook {
         );
     }
 
-    /// @notice Cancel an existing limit order with token refund
+    /// @notice Cancel an order and remove from tick bucket
     function cancelOrder(uint256 orderId) external {
         LimitOrder storage order = orders[orderId];
-
-        if (order.creator == address(0)) revert OrderNotFound();
-        if (order.creator != msg.sender) revert UnauthorizedCancellation();
-        if (order.isFilled) revert OrderAlreadyFilled();
-
-        // Refund tokens
-        if (order.zeroForOne && order.amount0 > 0) {
+        
+        require(order.creator == msg.sender, "Not order creator");
+        require(!order.isFilled, "Order already filled");
+        
+        // Calculate tick for cleanup
+        int24 tick = orderTickBucket[orderId];
+        
+        // Remove from tick bucket
+        uint256[] storage orderIds = tickToOrders[tick];
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            if (orderIds[i] == orderId) {
+                _removeFromArray(orderIds, i);
+                break;
+            }
+        }
+        
+        // Return tokens
+        if (order.zeroForOne) {
             IERC20(order.token0).safeTransfer(msg.sender, uint256(order.amount0));
-        } else if (!order.zeroForOne && order.amount1 > 0) {
+        } else {
             IERC20(order.token1).safeTransfer(msg.sender, uint256(order.amount1));
         }
-
-        delete orders[orderId];
+        
+        // Mark as cancelled by clearing creator
+        order.creator = address(0);
+        
         emit OrderCancelled(orderId, msg.sender);
     }
 
@@ -227,6 +246,10 @@ contract LimitOrderHook is BaseHook {
 
     function getUserOrders(address user) external view returns (uint256[] memory) {
         return userOrders[user];
+    }
+
+    function getTickBucket(int24 tick) external view returns (uint256[] memory) {
+        return tickToOrders[tick];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -266,43 +289,69 @@ contract LimitOrderHook is BaseHook {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Try to execute eligible limit orders
+    /// @notice Try to execute orders in a tick range (with lazy cleanup)
     function _tryExecuteOrders(
         PoolKey calldata poolKey,
         uint128 currentPrice,
         bool userSwapDirection
     ) internal returns (bool executed, int128 delta0, int128 delta1) {
+        // Get current tick
+        uint160 sqrtPriceX96 = uint128ToSqrtPrice(currentPrice);
+        int24 currentTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
+        
+        // Get tick spacing from pool (default to 60 if not available)
+        int24 tickSpacing = poolKey.tickSpacing;
+        
+        // Calculate tick range to check
+        int24 startTick = currentTick - (TICK_RANGE_WIDTH * tickSpacing);
+        int24 endTick = currentTick + (TICK_RANGE_WIDTH * tickSpacing);
+        
         address token0 = Currency.unwrap(poolKey.currency0);
         
-        for (uint256 i = 0; i < nextOrderId; i++) {
-            LimitOrder storage order = orders[i];
+        // Iterate through tick range
+        for (int24 tick = startTick; tick <= endTick; tick += tickSpacing) {
+            uint256[] storage orderIds = tickToOrders[tick];
             
-            if (order.creator == address(0) || order.isFilled) continue;
-            if (order.token0 != token0) continue;
+            if (orderIds.length == 0) continue;
             
-            // Check price trigger
-            if (!_isEligible(order, currentPrice)) {
-                continue;
+            // Iterate through orders in this tick (with lazy cleanup)
+            uint256 i = 0;
+            while (i < orderIds.length) {
+                uint256 orderId = orderIds[i];
+                LimitOrder storage order = orders[orderId];
+                
+                // Lazy cleanup: remove filled/cancelled orders
+                if (order.creator == address(0) || order.isFilled) {
+                    _removeFromArray(orderIds, i);
+                    continue; // Don't increment i (array shifted)
+                }
+                
+                // Skip if wrong pool
+                if (order.token0 != token0) {
+                    i++;
+                    continue;
+                }
+                
+                // Check price eligibility
+                if (!_isEligible(order, currentPrice)) {
+                    i++;
+                    continue;
+                }
+                
+                // Execute order
+                (int128 d0, int128 d1) = _executeOrderInBeforeSwap(orderId, poolKey, currentPrice);
+                
+                delta0 += d0;
+                delta1 += d1;
+                executed = true;
+                
+                // Remove executed order from array (already marked isFilled)
+                _removeFromArray(orderIds, i);
+                
+                // For MVP: execute only 1 order per swap (gas limit safety)
+                // TODO Phase 2.6: Implement gas metering for batch execution
+                return (executed, delta0, delta1);
             }
-            
-          
-            // Execute only if direction is opposite to user swap
-            // if (order.zeroForOne == userSwapDirection) {
-                // console2.log("SKIP: Same direction as user swap (would compete for liquidity)");
-                // continue;
-            // }
-            
-            // Execute order
-            (int128 d0, int128 d1) = _executeOrderInBeforeSwap(i, poolKey, currentPrice);
-            
-            delta0 += d0;
-            delta1 += d1;
-            executed = true;
-            
-            break;
-        }
-        
-        if (!executed) {
         }
     }
 
@@ -452,6 +501,36 @@ contract LimitOrderHook is BaseHook {
     /// @notice Get all orders in a specific tick bucket
     function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
         return tickToOrders[tick];
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        INTERNAL HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Align tick to tickSpacing grid (floor towards negative infinity)
+    function _alignTick(int24 tick, int24 tickSpacing) internal pure returns (int24) {
+        int24 compressed = tick / tickSpacing;
+        if (tick < 0 && tick % tickSpacing != 0) {
+            compressed--;
+        }
+        return compressed * tickSpacing;
+    }
+
+    /// @notice Remove element from array by swapping with last and popping
+    /// @dev Gas-efficient O(1) removal (doesn't preserve order)
+    /// @param array Storage array to modify
+    /// @param index Index of element to remove
+    function _removeFromArray(uint256[] storage array, uint256 index) private {
+        require(index < array.length, "Index out of bounds");
+        
+        // Swap with last element
+        uint256 lastIndex = array.length - 1;
+        if (index != lastIndex) {
+            array[index] = array[lastIndex];
+        }
+        
+        // Remove last element
+        array.pop();
     }
 
     /*//////////////////////////////////////////////////////////////
