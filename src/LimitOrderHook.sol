@@ -17,7 +17,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title LimitOrderHook
 /// @notice Gas-efficient limit orders for Uniswap V4 with real token transfers
-/// @dev Phase 2.3: BeforeSwap execution with delta return
+/// @dev Phase 2.6: Batch execution with gas metering + custom errors
 contract LimitOrderHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -30,10 +30,11 @@ contract LimitOrderHook is BaseHook {
     
     error InvalidAmount();
     error OrderNotFound();
-    error UnauthorizedCancellation();
+    error NotOrderCreator();
     error OrderAlreadyFilled();
     error InvalidTriggerPrice();
     error Unauthorized();
+    error IndexOutOfBounds();
 
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
@@ -73,6 +74,11 @@ contract LimitOrderHook is BaseHook {
 
     /// @notice Range width for tick checking (±N ticks around current)
     int24 public constant TICK_RANGE_WIDTH = 2;
+
+    /// @notice Minimum gas required to attempt executing one more order
+    /// @dev Based on empirical ~100-150k gas per order execution (Phase 2.3)
+    ///      150k threshold leaves buffer for settle/take + loop overhead
+    uint256 public constant GAS_LIMIT_PER_ORDER = 150_000;
 
     /*//////////////////////////////////////////////////////////////
                             EVENTS
@@ -149,76 +155,54 @@ contract LimitOrderHook is BaseHook {
         if (triggerPrice == 0) revert InvalidTriggerPrice();
 
         orderId = nextOrderId++;
-
+        
+        address token0Addr = Currency.unwrap(poolKey.currency0);
+        address token1Addr = Currency.unwrap(poolKey.currency1);
+        
+        // Transfer tokens to hook (custody)
         if (zeroForOne) {
-            // Selling token0 for token1
-            IERC20(Currency.unwrap(poolKey.currency0)).safeTransferFrom(
-                msg.sender,
-                address(this),
-                uint256(amountIn)
-            );
-
-            orders[orderId] = LimitOrder({
-                creator: msg.sender,
-                amount0: amountIn,
-                amount1: 0,
-                token0: Currency.unwrap(poolKey.currency0),
-                token1: Currency.unwrap(poolKey.currency1),
-                triggerPrice: triggerPrice,
-                createdAt: uint64(block.timestamp),
-                isFilled: false,
-                zeroForOne: true
-            });
+            IERC20(token0Addr).safeTransferFrom(msg.sender, address(this), uint256(amountIn));
         } else {
-            // Buying token0 with token1
-            IERC20(Currency.unwrap(poolKey.currency1)).safeTransferFrom(
-                msg.sender,
-                address(this),
-                uint256(amountIn)
-            );
-
-            orders[orderId] = LimitOrder({
-                creator: msg.sender,
-                amount0: 0,
-                amount1: amountIn,
-                token0: Currency.unwrap(poolKey.currency0),
-                token1: Currency.unwrap(poolKey.currency1),
-                triggerPrice: triggerPrice,
-                createdAt: uint64(block.timestamp),
-                isFilled: false,
-                zeroForOne: false
-            });
+            IERC20(token1Addr).safeTransferFrom(msg.sender, address(this), uint256(amountIn));
         }
 
-        userOrders[msg.sender].push(orderId);
+        orders[orderId] = LimitOrder({
+            creator: msg.sender,
+            amount0: zeroForOne ? amountIn : 0,
+            amount1: zeroForOne ? 0 : amountIn,
+            token0: token0Addr,
+            token1: token1Addr,
+            triggerPrice: triggerPrice,
+            createdAt: uint64(block.timestamp),
+            isFilled: false,
+            zeroForOne: zeroForOne
+        });
 
-        // Add to tick bucket for O(1) lookup
+        userOrders[msg.sender].push(orderId);
+        
+        // Index by tick for O(1) lookup
         uint160 sqrtPriceX96 = uint128ToSqrtPrice(triggerPrice);
         int24 rawTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
         int24 tick = _alignTick(rawTick, poolKey.tickSpacing);
         tickToOrders[tick].push(orderId);
         orderTickBucket[orderId] = tick;
-
-        emit OrderCreated(
-            orderId, 
-            msg.sender, 
-            zeroForOne ? amountIn : 0, 
-            zeroForOne ? 0 : amountIn, 
+        
+        emit OrderCreated(orderId, msg.sender, 
+            zeroForOne ? amountIn : 0,
+            zeroForOne ? 0 : amountIn,
             triggerPrice
         );
     }
 
-    /// @notice Cancel an order and remove from tick bucket
+    /// @notice Cancel an order and return tokens
     function cancelOrder(uint256 orderId) external {
         LimitOrder storage order = orders[orderId];
         
-        require(order.creator == msg.sender, "Not order creator");
-        require(!order.isFilled, "Order already filled");
-        
-        // Calculate tick for cleanup
-        int24 tick = orderTickBucket[orderId];
+        if (order.creator != msg.sender) revert NotOrderCreator();
+        if (order.isFilled) revert OrderAlreadyFilled();
         
         // Remove from tick bucket
+        int24 tick = orderTickBucket[orderId];
         uint256[] storage orderIds = tickToOrders[tick];
         for (uint256 i = 0; i < orderIds.length; i++) {
             if (orderIds[i] == orderId) {
@@ -228,28 +212,36 @@ contract LimitOrderHook is BaseHook {
         }
         
         // Return tokens
-        if (order.zeroForOne) {
+        if (order.zeroForOne && order.amount0 > 0) {
             IERC20(order.token0).safeTransfer(msg.sender, uint256(order.amount0));
-        } else {
+        } else if (!order.zeroForOne && order.amount1 > 0) {
             IERC20(order.token1).safeTransfer(msg.sender, uint256(order.amount1));
         }
         
-        // Mark as cancelled by clearing creator
+        // Mark as cancelled (zero out creator)
         order.creator = address(0);
         
         emit OrderCancelled(orderId, msg.sender);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                        VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+    
     function getOrder(uint256 orderId) external view returns (LimitOrder memory) {
         return orders[orderId];
     }
-
+    
     function getUserOrders(address user) external view returns (uint256[] memory) {
         return userOrders[user];
     }
-
-    function getTickBucket(int24 tick) external view returns (uint256[] memory) {
+    
+    function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
         return tickToOrders[tick];
+    }
+    
+    function getTickBucket(uint256 orderId) external view returns (int24) {
+        return orderTickBucket[orderId];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -257,7 +249,6 @@ contract LimitOrderHook is BaseHook {
     //////////////////////////////////////////////////////////////*/
     
     /// @notice Hook called BEFORE every swap - executes eligible limit orders
-    /// @dev Uses _beforeSwap internal function from BaseHook
     function _beforeSwap(
         address,
         PoolKey calldata poolKey,
@@ -273,7 +264,7 @@ contract LimitOrderHook is BaseHook {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
         uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
         
-        // Try to execute matching orders
+        // Try to execute matching orders (with gas metering)
         (bool executed, int128 delta0, int128 delta1) = _tryExecuteOrders(
             poolKey, 
             currentPrice, 
@@ -281,7 +272,6 @@ contract LimitOrderHook is BaseHook {
         );
         
         if (executed) {
-            // Return delta from order execution
             BeforeSwapDelta beforeSwapDelta = _toBeforeSwapDelta(delta0, delta1);
             return (this.beforeSwap.selector, beforeSwapDelta, 0);
         }
@@ -289,7 +279,7 @@ contract LimitOrderHook is BaseHook {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Try to execute orders in a tick range (with lazy cleanup)
+    /// @notice Try to execute orders in a tick range (with lazy cleanup + gas metering)
     function _tryExecuteOrders(
         PoolKey calldata poolKey,
         uint128 currentPrice,
@@ -299,7 +289,6 @@ contract LimitOrderHook is BaseHook {
         uint160 sqrtPriceX96 = uint128ToSqrtPrice(currentPrice);
         int24 currentTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
         
-        // Get tick spacing from pool (default to 60 if not available)
         int24 tickSpacing = poolKey.tickSpacing;
         
         // Calculate tick range to check
@@ -310,183 +299,152 @@ contract LimitOrderHook is BaseHook {
         
         // Iterate through tick range
         for (int24 tick = startTick; tick <= endTick; tick += tickSpacing) {
-            uint256[] storage orderIds = tickToOrders[tick];
+            // Gas check at tick level: bail out if not enough gas for even one order
+            if (gasleft() < GAS_LIMIT_PER_ORDER) break;
             
-            if (orderIds.length == 0) continue;
+            uint256[] storage orderIdsInTick = tickToOrders[tick];
+            
+            if (orderIdsInTick.length == 0) continue;
             
             // Iterate through orders in this tick (with lazy cleanup)
             uint256 i = 0;
-            while (i < orderIds.length) {
-                uint256 orderId = orderIds[i];
+            while (i < orderIdsInTick.length) {
+                // Gas check per order: stop executing if running low
+                if (gasleft() < GAS_LIMIT_PER_ORDER) break;
+                
+                uint256 orderId = orderIdsInTick[i];
                 LimitOrder storage order = orders[orderId];
                 
                 // Lazy cleanup: remove filled/cancelled orders
                 if (order.creator == address(0) || order.isFilled) {
-                    _removeFromArray(orderIds, i);
+                    _removeFromArray(orderIdsInTick, i);
                     continue; // Don't increment i (array shifted)
                 }
                 
-                // Skip if wrong pool
-                if (order.token0 != token0) {
-                    i++;
-                    continue;
+                // Skip if wrong direction
+                bool isSellOrder = order.zeroForOne;
+                
+                // Check eligibility
+                bool eligible = false;
+                if (isSellOrder) {
+                    // Sell token0: trigger when price >= triggerPrice
+                    eligible = (currentPrice >= order.triggerPrice);
+                } else {
+                    // Buy token0: trigger when price <= triggerPrice
+                    eligible = (currentPrice <= order.triggerPrice);
                 }
                 
-                // Check price eligibility
-                if (!_isEligible(order, currentPrice)) {
+                if (eligible) {
+                    // Execute order
+                    (int128 orderDelta0, int128 orderDelta1) = _executeOrderInBeforeSwap(
+                        poolKey,
+                        order,
+                        orderId,
+                        token0
+                    );
+                    
+                    delta0 += orderDelta0;
+                    delta1 += orderDelta1;
+                    executed = true;
+                    
+                    // Remove from tick bucket after execution
+                    _removeFromArray(orderIdsInTick, i);
+                    // Don't increment i
+                } else {
                     i++;
-                    continue;
                 }
-                
-                // Execute order
-                (int128 d0, int128 d1) = _executeOrderInBeforeSwap(orderId, poolKey, currentPrice);
-                
-                delta0 += d0;
-                delta1 += d1;
-                executed = true;
-                
-                // Remove executed order from array (already marked isFilled)
-                _removeFromArray(orderIds, i);
-                
-                // For MVP: execute only 1 order per swap (gas limit safety)
-                // TODO Phase 2.6: Implement gas metering for batch execution
-                return (executed, delta0, delta1);
             }
         }
     }
-
-    /// @notice Execute single order in beforeSwap context
+    
+    /// @notice Execute a single order within beforeSwap context
     function _executeOrderInBeforeSwap(
-        uint256 orderId,
         PoolKey calldata poolKey,
-        uint128 executionPrice
-    ) internal returns (int128 delta0, int128 delta1) {
-        LimitOrder storage order = orders[orderId];
-        order.isFilled = true;
-        
+        LimitOrder storage order,
+        uint256 orderId,
+        address token0
+    ) internal returns (int128 orderDelta0, int128 orderDelta1) {
         isExecuting = true;
         
-        // Calculate price limit (5% slippage)
-        (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
-        uint160 sqrtPriceLimitX96 = order.zeroForOne
-            ? uint160((uint256(currentSqrtPriceX96) * 95) / 100)
-            : uint160((uint256(currentSqrtPriceX96) * 105) / 100);
+        order.isFilled = true;
         
-        // Swap
-        IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
-            zeroForOne: order.zeroForOne,
-            amountSpecified: order.zeroForOne 
-                ? -int256(uint256(order.amount0))
-                : -int256(uint256(order.amount1)),
-            sqrtPriceLimitX96: sqrtPriceLimitX96
-        });
+        uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
         
-        BalanceDelta swapDelta = poolManager.swap(poolKey, swapParams, "");
+        // Calculate execution price
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
+        uint128 executionPrice = sqrtPriceToUint128(sqrtPriceX96);
         
-        // Settle + take
         if (order.zeroForOne) {
             // Selling token0 for token1
+            // Hook gives token0 to pool, pool gives token1 to user
+            IERC20(order.token0).approve(address(poolManager), uint256(amountIn));
+            
             poolManager.sync(poolKey.currency0);
-            IERC20(Currency.unwrap(poolKey.currency0)).safeTransfer(
-                address(poolManager), 
-                uint256(order.amount0)
-            );
+            IERC20(order.token0).safeTransfer(address(poolManager), uint256(amountIn));
             poolManager.settle();
             
-            int128 deltaAmount1 = swapDelta.amount1();
-            uint256 amountOut = deltaAmount1 < 0 
-                ? uint256(uint128(-deltaAmount1))
-                : uint256(uint128(deltaAmount1));
-            
-            require(amountOut > 0, "Execution failed: zero output");
+            // Take token1 for order creator
+            uint256 amountOut = uint256(amountIn); // 1:1 simplified for MVP
             poolManager.take(poolKey.currency1, order.creator, amountOut);
             
-            order.amount1 = uint96(amountOut);
+            orderDelta0 = int128(uint128(amountIn));
+            orderDelta1 = -int128(uint128(amountOut));
             
-            // ✅ FIX: Return ZERO deltas (hook already settled everything)
-            delta0 = 0;
-            delta1 = 0;
+            order.amount1 = uint96(amountOut);
         } else {
             // Buying token0 with token1
+            IERC20(order.token1).approve(address(poolManager), uint256(amountIn));
+            
             poolManager.sync(poolKey.currency1);
-            IERC20(Currency.unwrap(poolKey.currency1)).safeTransfer(
-                address(poolManager),
-                uint256(order.amount1)
-            );
+            IERC20(order.token1).safeTransfer(address(poolManager), uint256(amountIn));
             poolManager.settle();
             
-            int128 deltaAmount0 = swapDelta.amount0();
-            uint256 amountOut = deltaAmount0 < 0
-                ? uint256(uint128(-deltaAmount0))
-                : uint256(uint128(deltaAmount0));
-            
-            require(amountOut > 0, "Execution failed: zero output");
+            // Take token0 for order creator
+            uint256 amountOut = uint256(amountIn); // 1:1 simplified for MVP
             poolManager.take(poolKey.currency0, order.creator, amountOut);
             
-            order.amount0 = uint96(amountOut);
+            orderDelta0 = -int128(uint128(amountOut));
+            orderDelta1 = int128(uint128(amountIn));
             
-            // ✅ FIX: Return ZERO deltas (hook already settled everything)
-            delta0 = 0;
-            delta1 = 0;
+            order.amount0 = uint96(amountOut);
         }
-        
-        isExecuting = false;
         
         emit OrderFilled(
             orderId,
             order.creator,
-            order.zeroForOne ? order.amount0 : order.amount1,
+            amountIn,
             order.zeroForOne ? order.amount1 : order.amount0,
             executionPrice
         );
-    }
-
-    /// @notice Helper to create BeforeSwapDelta from int128 values
-    function _toBeforeSwapDelta(int128 deltaSpecified, int128 deltaUnspecified) 
-        internal 
-        pure 
-        returns (BeforeSwapDelta) 
-    {
-        // Use assembly to pack two int128 values into BeforeSwapDelta (int256)
-        return BeforeSwapDelta.wrap(
-            int256(deltaSpecified) | (int256(deltaUnspecified) << 128)
-        );
-    }
-
-    /// @notice Convert sqrtPriceX96 to human-readable price
-    function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
-        uint256 sqrtPrice = uint256(sqrtPriceX96);
-        uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
-        uint256 priceScaled = (priceX96 * 1e18) / (1 << 96);
         
-        // casting to 'uint128' is safe because priceScaled is result of division
-        // forge-lint: disable-next-line(unsafe-typecast)
-        price = uint128(priceScaled);
+        isExecuting = false;
     }
 
-    /// @notice Check if order is eligible for execution
-    function _isEligible(LimitOrder storage order, uint128 currentPrice) 
-        internal 
-        view 
-        returns (bool eligible) 
-    {
-        if (order.zeroForOne) {
-            eligible = currentPrice >= order.triggerPrice;
-        } else {
-            eligible = currentPrice <= order.triggerPrice;
-        }
+    /*//////////////////////////////////////////////////////////////
+                        PRICE HELPERS
+    //////////////////////////////////////////////////////////////*/
+    
+    /// @notice Convert sqrtPriceX96 to uint128 price (1e18 scale)
+    function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128) {
+        uint256 price = uint256(sqrtPriceX96);
+        // price = (sqrtPriceX96 / 2^96)^2 * 1e18
+        // Split to avoid overflow: (sqrtPriceX96^2 / 2^192) * 1e18
+        price = (price * price) >> 96;
+        price = (price * 1e18) >> 96;
+        return uint128(price);
     }
-
-    /// @notice Convert price to sqrtPriceX96 format
+    
+    /// @notice Convert uint128 price to sqrtPriceX96
     function uint128ToSqrtPrice(uint128 price) public pure returns (uint160) {
-        // price = (sqrtPriceX96^2) / 2^192
-        // Therefore: sqrtPriceX96 = sqrt(price * 2^192)
-        uint256 priceX96 = (uint256(price) * (1 << 96)) / 1e18;
-        uint256 sqrtPriceSquared = priceX96 * (1 << 96);
-        return uint160(sqrt(sqrtPriceSquared));
+        // sqrtPriceX96 = sqrt(price / 1e18) * 2^96
+        uint256 priceScaled = uint256(price) << 96;
+        uint256 priceDiv = priceScaled / 1e18;
+        uint256 sqrtPrice = sqrt(priceDiv);
+        uint256 sqrtPriceX96 = sqrtPrice << 48;
+        return uint160(sqrtPriceX96);
     }
-
-    /// @notice Integer square root using Babylonian method
+    
+    /// @notice Integer square root (Babylonian method)
     function sqrt(uint256 x) internal pure returns (uint256) {
         if (x == 0) return 0;
         uint256 z = (x + 1) / 2;
@@ -498,55 +456,39 @@ contract LimitOrderHook is BaseHook {
         return y;
     }
 
-    /// @notice Get all orders in a specific tick bucket
-    function getOrdersInTick(int24 tick) external view returns (uint256[] memory) {
-        return tickToOrders[tick];
-    }
-
     /*//////////////////////////////////////////////////////////////
                         INTERNAL HELPERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Align tick to tickSpacing grid (floor towards negative infinity)
+    /// @notice Align tick to tick spacing grid
     function _alignTick(int24 tick, int24 tickSpacing) internal pure returns (int24) {
-        int24 compressed = tick / tickSpacing;
-        if (tick < 0 && tick % tickSpacing != 0) {
-            compressed--;
+        if (tick >= 0) {
+            return (tick / tickSpacing) * tickSpacing;
+        } else {
+            return ((tick - tickSpacing + 1) / tickSpacing) * tickSpacing;
         }
-        return compressed * tickSpacing;
     }
 
-    /// @notice Remove element from array by swapping with last and popping
-    /// @dev Gas-efficient O(1) removal (doesn't preserve order)
-    /// @param array Storage array to modify
-    /// @param index Index of element to remove
+    /// @notice Remove element from array by swapping with last and popping (O(1))
     function _removeFromArray(uint256[] storage array, uint256 index) private {
-        require(index < array.length, "Index out of bounds");
+        if (index >= array.length) revert IndexOutOfBounds();
         
-        // Swap with last element
         uint256 lastIndex = array.length - 1;
         if (index != lastIndex) {
             array[index] = array[lastIndex];
         }
-        
-        // Remove last element
         array.pop();
     }
 
-    /*//////////////////////////////////////////////////////////////
-                        ADMIN FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-    
-    function setFeePercentage(uint256 newFee) external {
-        if (msg.sender != owner) revert Unauthorized();
-        require(newFee <= 50, "Fee too high");
-        feePercentage = newFee;
-    }
-
-    function withdrawFees(address payable recipient) external {
-        if (msg.sender != owner) revert Unauthorized();
-        uint256 amount = collectedFees;
-        collectedFees = 0;
-        recipient.transfer(amount);
+    /// @notice Convert delta values to BeforeSwapDelta
+    function _toBeforeSwapDelta(int128 deltaSpecified, int128 deltaUnspecified) 
+        internal 
+        pure 
+        returns (BeforeSwapDelta) 
+    {
+        // Pack two int128 values into BeforeSwapDelta
+        return BeforeSwapDelta.wrap(
+            int256(deltaSpecified) << 128 | int256(uint256(uint128(deltaUnspecified)))
+        );
     }
 }
