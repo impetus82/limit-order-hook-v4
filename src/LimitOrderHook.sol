@@ -132,9 +132,10 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     ///      Separate from ReentrancyGuard which protects external entry points.
     bool private isExecuting;
 
-    /// @notice Range width for tick checking (±N ticks around current price)
-    /// @dev With tickSpacing=60, this checks ±120 ticks around current price
-    int24 public constant TICK_RANGE_WIDTH = 2;
+    /// @notice Maximum tick buckets to scan per swap (gas safety)
+    /// @dev With tickSpacing=60, 100 buckets covers a 6000-tick range.
+    ///      Limits gas usage when many tick buckets have orders.
+    int24 public constant MAX_TICK_SCAN = 100;
 
     /// @notice Minimum gas required to attempt executing one more order
     /// @dev Empirically measured: ~100k gas per order execution (settle + take + SSTORE).
@@ -340,7 +341,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     function _beforeSwap(
         address,
         PoolKey calldata poolKey,
-        IPoolManager.SwapParams calldata,
+        IPoolManager.SwapParams calldata params,
         bytes calldata
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
         // Prevent recursion from settle/take callbacks
@@ -355,7 +356,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         // Try to execute matching orders (with gas metering)
         (bool executed, int128 delta0, int128 delta1) = _tryExecuteOrders(
             poolKey,
-            currentPrice
+            currentPrice,
+            params.zeroForOne
         );
 
         if (executed) {
@@ -366,86 +368,90 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Scan tick range and execute eligible orders with gas metering
-    /// @dev Two-level gas check: at tick-level and per-order level.
-    ///      Lazy cleanup removes stale (filled/cancelled) orders during scan.
+    /// @notice Scan tick buckets directionally and execute eligible orders
+    /// @dev Scans in the direction that matches eligible orders:
+    ///      - !zeroForOne swap (price going UP) → scan downward for sell orders
+    ///        whose triggerPrice <= currentPrice (stored at lower ticks)
+    ///      - zeroForOne swap (price going DOWN) → scan upward for buy orders
+    ///        whose triggerPrice >= currentPrice (stored at higher ticks)
+    ///      Gas-metered: stops after MAX_TICK_SCAN buckets or GAS_LIMIT_PER_ORDER.
+    ///      Lazy cleanup removes stale orders during iteration.
     function _tryExecuteOrders(
         PoolKey calldata poolKey,
-        uint128 currentPrice
+        uint128 currentPrice,
+        bool swapZeroForOne
     ) internal returns (bool executed, int128 delta0, int128 delta1) {
-        // Get current tick from price
-        uint160 sqrtPriceX96 = uint128ToSqrtPrice(currentPrice);
-        int24 currentTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
-
+        int24 currentTick = TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(currentPrice));
         int24 tickSpacing = poolKey.tickSpacing;
-
-        // Calculate tick range to check (±TICK_RANGE_WIDTH × tickSpacing)
-        int24 startTick = currentTick - (TICK_RANGE_WIDTH * tickSpacing);
-        int24 endTick = currentTick + (TICK_RANGE_WIDTH * tickSpacing);
+        int24 alignedCurrentTick = _alignTick(currentTick, tickSpacing);
 
         address token0 = Currency.unwrap(poolKey.currency0);
 
-        // Iterate through tick range
-        for (int24 tick = startTick; tick <= endTick; tick += tickSpacing) {
-            // Gas check at tick level
+        // Determine scan direction based on swap direction:
+        // A !zeroForOne swap pushes price UP → execute SELL orders (stored at lower ticks)
+        // A zeroForOne swap pushes price DOWN → execute BUY orders (stored at higher ticks)
+        int24 scanStep = swapZeroForOne ? tickSpacing : -tickSpacing;
+        int24 tick = alignedCurrentTick;
+
+        for (int24 count = 0; count < MAX_TICK_SCAN; count++) {
             if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
             uint256[] storage orderIdsInTick = tickToOrders[tick];
 
-            if (orderIdsInTick.length == 0) continue;
+            if (orderIdsInTick.length > 0) {
+                uint256 i = 0;
+                while (i < orderIdsInTick.length) {
+                    if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
-            // Iterate orders in this tick (with lazy cleanup)
-            uint256 i = 0;
-            while (i < orderIdsInTick.length) {
-                // Gas check per order
-                if (gasleft() < GAS_LIMIT_PER_ORDER) break;
+                    uint256 orderId = orderIdsInTick[i];
+                    LimitOrder storage order = orders[orderId];
 
-                uint256 orderId = orderIdsInTick[i];
-                LimitOrder storage order = orders[orderId];
-
-                // Lazy cleanup: remove filled/cancelled orders
-                if (order.creator == address(0) || order.isFilled) {
-                    _removeFromArray(orderIdsInTick, i);
-                    continue; // Don't increment i (array shifted)
-                }
-
-                // Skip if wrong pool
-                if (order.token0 != token0) {
-                    i++;
-                    continue;
-                }
-
-                // Check price eligibility
-                bool eligible = false;
-                if (order.zeroForOne) {
-                    // Sell token0: trigger when price >= triggerPrice
-                    eligible = (currentPrice >= order.triggerPrice);
-                } else {
-                    // Buy token0: trigger when price <= triggerPrice
-                    eligible = (currentPrice <= order.triggerPrice);
-                }
-
-                if (eligible) {
-                    (int128 orderDelta0, int128 orderDelta1) = _executeOrderInBeforeSwap(
-                        poolKey,
-                        order,
-                        orderId
-                    );
-
-                    // Only count as executed if deltas are non-zero
-                    if (orderDelta0 != 0 || orderDelta1 != 0) {
-                        delta0 += orderDelta0;
-                        delta1 += orderDelta1;
-                        executed = true;
+                    // Lazy cleanup: remove filled/cancelled orders
+                    if (order.creator == address(0) || order.isFilled) {
+                        _removeFromArray(orderIdsInTick, i);
+                        continue;
                     }
 
-                    // Remove from tick bucket after execution attempt
-                    _removeFromArray(orderIdsInTick, i);
-                    // Don't increment i
-                } else {
-                    i++;
+                    // Skip if wrong pool
+                    if (order.token0 != token0) {
+                        i++;
+                        continue;
+                    }
+
+                    // Check price eligibility
+                    bool eligible = false;
+                    if (order.zeroForOne) {
+                        // Sell token0: trigger when price >= triggerPrice
+                        eligible = (currentPrice >= order.triggerPrice);
+                    } else {
+                        // Buy token0: trigger when price <= triggerPrice
+                        eligible = (currentPrice <= order.triggerPrice);
+                    }
+
+                    if (eligible) {
+                        (int128 orderDelta0, int128 orderDelta1) = _executeOrderInBeforeSwap(
+                            poolKey,
+                            order,
+                            orderId
+                        );
+
+                        if (orderDelta0 != 0 || orderDelta1 != 0) {
+                            delta0 += orderDelta0;
+                            delta1 += orderDelta1;
+                            executed = true;
+                        }
+
+                        _removeFromArray(orderIdsInTick, i);
+                    } else {
+                        i++;
+                    }
                 }
             }
+
+            tick += scanStep;
+
+            // Safety: don't go beyond Uniswap's tick range
+            if (tick > TickMath.MAX_TICK || tick < TickMath.MIN_TICK) break;
         }
     }
 
