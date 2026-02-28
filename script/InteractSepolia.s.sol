@@ -39,9 +39,9 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 // ============================================================
 abstract contract SepoliaConfig is Script {
     // --- Deployed addresses from Phase 3.3 + 3.4 ---
-    address constant HOOK = 0xE96fDfF54e9eD65E22e00fe57C425348dd58c088;
-    address constant TOKEN0 = 0x388D28a3D9aFcBdaeb97a359FC67A0B53fC0146E; // TTA (sorted)
-    address constant TOKEN1 = 0xa913a8019dd32691d7a9316a3d6cB75BA3904325; // TTB (sorted)
+    address constant HOOK = 0xF1825a46608cadA9AFc3290397Ba7C77797E4040;
+    address constant TOKEN0 = 0x7AfF4F1a79d86095A6E2eBEF1dcfF7c263e55970; // TTA (sorted)
+    address constant TOKEN1 = 0xc1Fb22AE10BDB0545737825998BE99569b64E931; // TTB (sorted)
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // --- Pool parameters (must match SetupSepolia) ---
@@ -125,7 +125,7 @@ contract CreateOrder is SepoliaConfig {
 ///         the price UP (making token0 more expensive), which should trigger
 ///         zeroForOne sell orders.
 contract ExecuteSwap is SepoliaConfig {
-    uint256 constant SWAP_AMOUNT = 50_000 ether; // 50 TTB -> swap for TTA
+    uint256 constant SWAP_AMOUNT = 50000 ether; // 500 TTB — достаточно для ~1-2% движения цены
 
     function run() external {
         uint256 pk = _deployerKey();
@@ -133,7 +133,7 @@ contract ExecuteSwap is SepoliaConfig {
 
         console2.log("=== Execute Swap (Sepolia) ===");
         console2.log("Deployer:", deployer);
-        console2.log("Swap: 50 TTB -> TTA (push price UP)");
+        console2.log("Swap: 500 TTB -> TTA (push price UP ~1-2%)");
 
         vm.startBroadcast(pk);
 
@@ -173,7 +173,7 @@ contract ExecuteSwap is SepoliaConfig {
 
         console2.log("");
         console2.log("=== SWAP EXECUTED ===");
-        console2.log("Swapped 50 TTB -> TTA");
+        console2.log("Swapped 500 TTB -> TTA");
         console2.log("Price should have moved UP");
         console2.log("Any sell orders with triggerPrice <= new price should be filled");
         console2.log("");

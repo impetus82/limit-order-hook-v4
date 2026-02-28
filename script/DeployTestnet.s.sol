@@ -14,18 +14,16 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 ///     --etherscan-api-key $ETHERSCAN_API_KEY -vvvv
 contract DeployTestnet is Script {
     // Uniswap V4 PoolManager Canonical Singleton
-    address constant POOL_MANAGER = 0x00000000000444079899e9846284F88E1A164906;
+    address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // beforeSwap + beforeSwapReturnDelta
-    uint160 constant HOOK_FLAGS = uint160(
-        Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
-    );
+    uint160 constant HOOK_FLAGS = uint160(Hooks.AFTER_SWAP_FLAG);
 
     // Foundry's deterministic CREATE2 deployer used by `forge script`
     // See: https://github.com/Arachnid/deterministic-deployment-proxy
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
-    uint256 constant MAX_ITERATIONS = 10_000_000;
+    uint256 constant MAX_ITERATIONS = 100_000_000;
 
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
@@ -43,7 +41,7 @@ contract DeployTestnet is Script {
         console2.log("\nMining salt...");
 
         bytes memory creationCode = type(LimitOrderHook).creationCode;
-        bytes memory constructorArgs = abi.encode(IPoolManager(POOL_MANAGER));
+        bytes memory constructorArgs = abi.encode(IPoolManager(POOL_MANAGER), deployer);
         bytes32 initCodeHash = keccak256(abi.encodePacked(creationCode, constructorArgs));
 
         address predictedAddr;
@@ -70,9 +68,10 @@ contract DeployTestnet is Script {
         vm.startBroadcast(deployerPrivateKey);
 
         LimitOrderHook hook = new LimitOrderHook{salt: salt}(
-            IPoolManager(POOL_MANAGER)
+            IPoolManager(POOL_MANAGER),
+            deployer
         );
-
+        
         vm.stopBroadcast();
 
         // ---- Verify ----

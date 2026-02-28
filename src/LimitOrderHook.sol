@@ -17,39 +17,43 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
-/// @title LimitOrderHook — Uniswap V4 Hook for On-Chain Limit Orders
+/// @title LimitOrderHook - Uniswap V4 Hook for On-Chain Limit Orders
 /// @author Yuri (Crypto Side Hustle 2026)
 /// @notice Allows users to place limit orders that execute automatically when
 ///         the pool price reaches a specified trigger price during swaps.
 ///
-/// @dev Architecture Overview:
+/// @dev Architecture Overview (Phase 3.10 - afterSwap migration):
 ///
 ///   **Tick Bucket Indexing (O(1) Lookup)**
 ///   Orders are indexed by their aligned tick in `tickToOrders` mapping.
-///   When a swap occurs, only ticks within ±TICK_RANGE_WIDTH of the current
-///   price are scanned, avoiding O(N) iteration over all orders.
+///   When a swap occurs, only ticks within the crossed range are scanned.
 ///
-///   **Flash Accounting (BeforeSwap + ReturnDelta)**
-///   Execution happens in `beforeSwap` using the `beforeSwapReturnDelta` flag.
-///   The hook settles token0 into PoolManager and takes token1 (or vice versa)
-///   for the order creator, returning deltas that modify the swap outcome.
+///   **afterSwap Execution**
+///   Execution happens in `afterSwap`, AFTER the user's swap has moved the price.
+///   This ensures the hook sees the real post-swap price and can correctly determine
+///   which orders are now eligible. The hook then executes its own internal swaps
+///   via poolManager.swap() to fill each eligible order.
+///
+///   **Why afterSwap instead of beforeSwap?**
+///   In beforeSwap, the pool price hasn't changed yet, so orders above/below the
+///   current price can never be detected as eligible. afterSwap sees the actual
+///   post-swap price, solving this fundamental timing issue.
 ///
 ///   **Lazy Cleanup**
 ///   Filled and cancelled orders are removed from tick buckets during iteration
-///   (swap-and-pop), amortizing cleanup cost across future swaps rather than
-///   paying it upfront during cancellation.
+///   (swap-and-pop), amortizing cleanup cost across future swaps.
 ///
 ///   **Gas Metering (DoS Protection)**
 ///   A two-level `gasleft()` check prevents out-of-gas reverts when many orders
 ///   are queued. Execution stops gracefully; remaining orders persist for the
 ///   next swap.
 ///
-///   **Security (Phase 3.2 → 3.3)**
+///   **Security**
 ///   - ReentrancyGuard on createLimitOrder and cancelOrder (ERC-777 defense)
 ///   - Slippage protection: amountOut validated against triggerPrice
 ///   - Pool key validation: tickSpacing > 0 check
-///   - SafeCast for all unsafe truncation paths (Phase 3.3)
-///   - Ownable (OpenZeppelin) replaces manual owner logic (Phase 3.3)
+///   - SafeCast for all unsafe truncation paths
+///   - Ownable (OpenZeppelin) for admin functions
 ///
 ///   **Custom Errors**
 ///   All reverts use custom errors instead of string messages, saving ~600 gas
@@ -93,7 +97,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @dev Slot packing:
     ///   slot 0: creator (20 bytes) + amount0 (12 bytes)
     ///   slot 1: amount1 (12 bytes) + token0 (20 bytes)
-    ///   slot 2: token1 (20 bytes) — padded
+    ///   slot 2: token1 (20 bytes) - padded
     ///   slot 3: triggerPrice (16 bytes) + createdAt (8 bytes) + isFilled (1 byte) + zeroForOne (1 byte)
     struct LimitOrder {
         address creator;
@@ -124,17 +128,16 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @dev Key is the aligned tick (rounded to tickSpacing grid)
     mapping(int24 => uint256[]) public tickToOrders;
 
-    /// @notice Reverse mapping: orderId → aligned tick bucket
+    /// @notice Reverse mapping: orderId -> aligned tick bucket
     mapping(uint256 => int24) private orderTickBucket;
 
-    /// @dev Reentrancy guard for execution — prevents recursive execution during
+    /// @dev Reentrancy guard for execution - prevents recursive execution during
     ///      PoolManager callbacks triggered by order settlement.
     ///      Separate from ReentrancyGuard which protects external entry points.
     bool private isExecuting;
 
     /// @notice Maximum tick buckets to scan per swap (gas safety)
     /// @dev With tickSpacing=60, 100 buckets covers a 6000-tick range.
-    ///      Limits gas usage when many tick buckets have orders.
     int24 public constant MAX_TICK_SCAN = 100;
 
     /// @notice Minimum gas required to attempt executing one more order
@@ -178,9 +181,10 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @param _poolManager The Uniswap V4 PoolManager contract
-    constructor(IPoolManager _poolManager)
+    /// @param _initialOwner The address that will own this contract (EOA deployer)
+    constructor(IPoolManager _poolManager, address _initialOwner)
         BaseHook(_poolManager)
-        Ownable(msg.sender)
+        Ownable(_initialOwner)
     {}
 
     /*//////////////////////////////////////////////////////////////
@@ -188,7 +192,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Declare which hook callbacks this contract implements
-    /// @dev Enables beforeSwap + beforeSwapReturnDelta.
+    /// @dev Phase 3.10: afterSwap only (no beforeSwap, no returnDelta)
     function getHookPermissions()
         public
         pure
@@ -202,11 +206,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
-            beforeSwap: true,
-            afterSwap: false,
+            beforeSwap: false,
+            afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: true,
+            beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -335,44 +339,42 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                         EXECUTION LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Hook callback — executes eligible limit orders before each swap
-    /// @dev Called by PoolManager. Reads the current pool price, scans nearby
-    ///      tick buckets, and executes matching orders via flash accounting.
-    function _beforeSwap(
+    /// @notice Hook callback - executes eligible limit orders AFTER each swap
+    /// @dev Called by PoolManager after the swap has completed and price has moved.
+    ///      Reads the new post-swap price, scans tick buckets between the pre-swap
+    ///      and post-swap ticks, and executes matching orders.
+    ///
+    ///      Phase 3.10: Migrated from beforeSwap to afterSwap to solve the
+    ///      fundamental timing issue where beforeSwap sees pre-swap price and
+    ///      cannot detect orders that become eligible after the price moves.
+    function _afterSwap(
         address,
         PoolKey calldata poolKey,
         IPoolManager.SwapParams calldata params,
+        BalanceDelta,
         bytes calldata
-    ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
-        // Prevent recursion from settle/take callbacks
+    ) internal override returns (bytes4, int128) {
+        // Prevent recursion from our own internal swaps
         if (isExecuting) {
-            return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            return (this.afterSwap.selector, 0);
         }
 
-        // Get current price
+        // Read the ACTUAL post-swap price
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
         uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
 
-        // Try to execute matching orders (with gas metering)
-        (bool executed, int128 delta0, int128 delta1) = _tryExecuteOrders(
-            poolKey,
-            currentPrice,
-            params.zeroForOne
-        );
+        // Execute matching orders
+        _tryExecuteOrders(poolKey, currentPrice, params.zeroForOne);
 
-        if (executed) {
-            BeforeSwapDelta beforeSwapDelta = _toBeforeSwapDelta(delta0, delta1);
-            return (this.beforeSwap.selector, beforeSwapDelta, 0);
-        }
-
-        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        return (this.afterSwap.selector, 0);
     }
 
     /// @notice Scan tick buckets directionally and execute eligible orders
-    /// @dev Scans in the direction that matches eligible orders:
-    ///      - !zeroForOne swap (price going UP) → scan downward for sell orders
+    /// @dev Scans from the current (post-swap) tick in the direction where
+    ///      eligible orders are likely to be found:
+    ///      - !zeroForOne swap (price went UP) -> scan downward for sell orders
     ///        whose triggerPrice <= currentPrice (stored at lower ticks)
-    ///      - zeroForOne swap (price going DOWN) → scan upward for buy orders
+    ///      - zeroForOne swap (price went DOWN) -> scan upward for buy orders
     ///        whose triggerPrice >= currentPrice (stored at higher ticks)
     ///      Gas-metered: stops after MAX_TICK_SCAN buckets or GAS_LIMIT_PER_ORDER.
     ///      Lazy cleanup removes stale orders during iteration.
@@ -380,7 +382,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         PoolKey calldata poolKey,
         uint128 currentPrice,
         bool swapZeroForOne
-    ) internal returns (bool executed, int128 delta0, int128 delta1) {
+    ) internal {
         int24 currentTick = TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(currentPrice));
         int24 tickSpacing = poolKey.tickSpacing;
         int24 alignedCurrentTick = _alignTick(currentTick, tickSpacing);
@@ -388,8 +390,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         address token0 = Currency.unwrap(poolKey.currency0);
 
         // Determine scan direction based on swap direction:
-        // A !zeroForOne swap pushes price UP → execute SELL orders (stored at lower ticks)
-        // A zeroForOne swap pushes price DOWN → execute BUY orders (stored at higher ticks)
+        // A !zeroForOne swap pushed price UP -> execute SELL orders (stored at lower ticks)
+        // A zeroForOne swap pushed price DOWN -> execute BUY orders (stored at higher ticks)
         int24 scanStep = swapZeroForOne ? tickSpacing : -tickSpacing;
         int24 tick = alignedCurrentTick;
 
@@ -429,18 +431,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                     }
 
                     if (eligible) {
-                        (int128 orderDelta0, int128 orderDelta1) = _executeOrderInBeforeSwap(
-                            poolKey,
-                            order,
-                            orderId
-                        );
-
-                        if (orderDelta0 != 0 || orderDelta1 != 0) {
-                            delta0 += orderDelta0;
-                            delta1 += orderDelta1;
-                            executed = true;
-                        }
-
+                        _executeOrder(poolKey, order, orderId);
                         _removeFromArray(orderIdsInTick, i);
                     } else {
                         i++;
@@ -455,25 +446,28 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         }
     }
 
-    /// @notice Execute a single order within the beforeSwap context
-    /// @dev Settles input tokens into PoolManager and takes output tokens
-    ///      for the order creator. Validates amountOut against triggerPrice
-    ///      with MAX_SLIPPAGE_BPS tolerance (H-1, H-2 fix).
-    ///      Uses SafeCast for all uint256→uint96/uint128/uint160 conversions (Phase 3.3).
-    function _executeOrderInBeforeSwap(
+    /// @notice Execute a single order via internal swap
+    /// @dev Performs a swap through PoolManager to fill the order:
+    ///      1. Approve PoolManager for the input token
+    ///      2. Execute swap via poolManager.swap()
+    ///      3. Settle input tokens (sync + transfer + settle)
+    ///      4. Take output tokens for the order creator
+    ///      5. Validate slippage and mark order as filled
+    ///
+    ///      Uses SafeCast for all uint256->uint96/uint128/uint160 conversions.
+    function _executeOrder(
         PoolKey calldata poolKey,
         LimitOrder storage order,
         uint256 orderId
-    ) internal returns (int128 orderDelta0, int128 orderDelta1) {
+    ) internal {
         isExecuting = true;
 
         uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
 
-        // --- Perform the swap via PoolManager ---
+        // Get current price for slippage limit
         (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
 
-        // Price limit: 5% slippage on the swap itself
-        // SafeCast: uint256 → uint160 for sqrtPriceLimitX96
+        // Price limit: 5% slippage on the internal swap
         uint160 sqrtPriceLimitX96 = order.zeroForOne
             ? ((uint256(currentSqrtPriceX96) * 95) / 100).toUint160()
             : ((uint256(currentSqrtPriceX96) * 105) / 100).toUint160();
@@ -488,7 +482,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
         BalanceDelta swapDelta = poolManager.swap(poolKey, swapParams, "");
 
-        // --- Settle input + Take output ---
+        // Settle input + Take output
         if (order.zeroForOne) {
             // Selling token0 for token1
             poolManager.sync(poolKey.currency0);
@@ -497,12 +491,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
             // Extract amountOut from swap delta
             int128 deltaAmount1 = swapDelta.amount1();
-            // Sign is checked before cast — safe truncation (int128 → uint128)
             uint256 amountOut = deltaAmount1 < 0
                 ? uint256(uint128(-deltaAmount1))
                 : uint256(uint128(deltaAmount1));
 
-            // --- H-1/H-2 FIX: Slippage protection ---
+            // H-1/H-2 FIX: Slippage protection
             uint256 expectedOut = (uint256(amountIn) * uint256(order.triggerPrice)) / 1e18;
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
@@ -514,12 +507,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             poolManager.take(poolKey.currency1, order.creator, amountOut);
 
             order.isFilled = true;
-            // SafeCast: uint256 → uint96
             order.amount1 = amountOut.toUint96();
-
-            // Return ZERO deltas — hook already settled everything via sync/settle/take
-            orderDelta0 = 0;
-            orderDelta1 = 0;
         } else {
             // Buying token0 with token1
             poolManager.sync(poolKey.currency1);
@@ -527,12 +515,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             poolManager.settle();
 
             int128 deltaAmount0 = swapDelta.amount0();
-            // Sign is checked before cast — safe truncation (int128 → uint128)
             uint256 amountOut = deltaAmount0 < 0
                 ? uint256(uint128(-deltaAmount0))
                 : uint256(uint128(deltaAmount0));
 
-            // --- H-1/H-2 FIX: Slippage protection ---
+            // H-1/H-2 FIX: Slippage protection
             uint256 expectedOut = (uint256(amountIn) * 1e18) / uint256(order.triggerPrice);
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
@@ -544,12 +531,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             poolManager.take(poolKey.currency0, order.creator, amountOut);
 
             order.isFilled = true;
-            // SafeCast: uint256 → uint96
             order.amount0 = amountOut.toUint96();
-
-            // Return ZERO deltas — hook already settled everything via sync/settle/take
-            orderDelta0 = 0;
-            orderDelta1 = 0;
         }
 
         emit OrderFilled(
@@ -568,12 +550,12 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Convert sqrtPriceX96 (Uniswap format) to uint128 price scaled to 1e18
-    /// @dev Formula: price = (sqrtPriceX96² / 2^192) × 1e18
+    /// @dev Formula: price = (sqrtPriceX96^2 / 2^192) * 1e18
     function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
         uint256 priceScaled = (priceX96 * 1e18) / (1 << 96);
-        // SafeCast: uint256 → uint128
+        // SafeCast: uint256 -> uint128
         price = priceScaled.toUint128();
     }
 
@@ -583,7 +565,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         uint256 priceX192 = (uint256(price) * (1 << 96)) / 1e18;
         uint256 priceX96Full = priceX192 * (1 << 96);
         uint256 sqrtPriceRaw = sqrt(priceX96Full);
-        // SafeCast: uint256 → uint160
+        // SafeCast: uint256 -> uint160
         sqrtPriceX96 = sqrtPriceRaw.toUint160();
     }
 
@@ -619,10 +601,5 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         if (index >= arr.length) revert IndexOutOfBounds();
         arr[index] = arr[arr.length - 1];
         arr.pop();
-    }
-
-    /// @notice Pack two int128 deltas into a BeforeSwapDelta
-    function _toBeforeSwapDelta(int128 delta0, int128 delta1) internal pure returns (BeforeSwapDelta) {
-        return toBeforeSwapDelta(delta0, delta1);
     }
 }

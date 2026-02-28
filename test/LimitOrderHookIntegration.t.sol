@@ -48,12 +48,9 @@ contract LimitOrderHookIntegrationTest is Test {
             (token0, token1) = (token1, token0);
         }
         
-        // Mine hook address with correct flags
-        uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | 
-            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
-        );
-        bytes memory constructorArgs = abi.encode(address(manager));
+        // Phase 3.10: afterSwap only (AFTER_SWAP_FLAG)
+        uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
+        bytes memory constructorArgs = abi.encode(address(manager), address(this));
         
         vm.pauseGasMetering();
         (address predictedAddress, bytes32 salt) = HookMiner.find(
@@ -63,7 +60,7 @@ contract LimitOrderHookIntegrationTest is Test {
             constructorArgs
         );
         
-        hook = new LimitOrderHook{salt: salt}(IPoolManager(address(manager)));
+        hook = new LimitOrderHook{salt: salt}(IPoolManager(address(manager)), address(this));
         require(address(hook) == predictedAddress, "Hook address mismatch!");
         vm.resumeGasMetering();
         
@@ -141,7 +138,7 @@ contract LimitOrderHookIntegrationTest is Test {
         hook.createLimitOrder(poolKey, true, 0, 1e18);
     }
 
-    /// @notice M-2: Validate poolKey — tickSpacing must be > 0
+    /// @notice M-2: Validate poolKey - tickSpacing must be > 0
     function testInvalidPoolKeyFails() public {
         PoolKey memory badPoolKey = PoolKey({
             currency0: Currency.wrap(address(token0)),
@@ -188,16 +185,20 @@ contract LimitOrderHookIntegrationTest is Test {
                         EXECUTION TESTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Test: BUY order (zeroForOne=false) triggers when price drops
+    /// @dev afterSwap sees post-swap price. zeroForOne swap pushes price DOWN.
+    ///      BUY order with triggerPrice=1.002 triggers when price <= 1.002.
+    ///      After zeroForOne swap, price < 1.0 < 1.002, so order is eligible.
     function testFullOrderExecution() public {
-        // Alice creates a BUY order (zeroForOne=false): buy token0 with token1
-        // triggerPrice > currentPrice so it triggers immediately on beforeSwap
+        // Alice creates a BUY order: buy token0 with token1
+        // triggerPrice = 1.002 => triggers when price <= 1.002
         uint96 amountIn = 1e18;
         uint128 triggerPrice = 1.002e18;
         
         vm.prank(alice);
         uint256 orderId = hook.createLimitOrder(poolKey, false, amountIn, triggerPrice);
         
-        // Bob triggers a swap
+        // Bob triggers a zeroForOne swap (price goes DOWN)
         token0.mint(address(this), 50e18);
         token0.approve(address(swapRouter), type(uint256).max);
         
@@ -218,6 +219,41 @@ contract LimitOrderHookIntegrationTest is Test {
         LimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
         assertTrue(order.isFilled, "Order should be filled");
         assertTrue(order.amount0 > 0, "Alice should have received token0");
+    }
+
+    /// @notice Test: SELL order (zeroForOne=true) triggers when price rises
+    /// @dev afterSwap sees post-swap price. !zeroForOne swap pushes price UP.
+    ///      SELL order with triggerPrice=1.002 triggers when price >= 1.002.
+    function testSellOrderExecution() public {
+        // Alice creates a SELL order: sell token0 for token1
+        // triggerPrice = 1.002 => triggers when price >= 1.002
+        uint96 amountIn = 1e18;
+        uint128 triggerPrice = 1.002e18;
+
+        vm.prank(alice);
+        uint256 orderId = hook.createLimitOrder(poolKey, true, amountIn, triggerPrice);
+
+        // Swap !zeroForOne to push price UP above 1.002
+        token1.mint(address(this), 50e18);
+        token1.approve(address(swapRouter), type(uint256).max);
+
+        swapRouter.swap(
+            poolKey,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -50e18,
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            ""
+        );
+
+        LimitOrderHook.LimitOrder memory order = hook.getOrder(orderId);
+        assertTrue(order.isFilled, "Sell order should be filled after price UP");
+        assertTrue(order.amount1 > 0, "Alice should have received token1");
     }
 
     function testRangeExecution() public {
@@ -253,7 +289,7 @@ contract LimitOrderHookIntegrationTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function testBatchExecution() public {
-        // Create multiple orders
+        // Create multiple BUY orders
         vm.startPrank(alice);
         for (uint256 i = 0; i < 5; i++) {
             hook.createLimitOrder(poolKey, false, 1e18, 1.002e18);
