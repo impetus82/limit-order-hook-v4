@@ -4,9 +4,11 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
@@ -14,7 +16,7 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 
 /// @title InteractSepolia — Live interaction with LimitOrderHook on Sepolia
 /// @author Yuri (Crypto Side Hustle 2026)
-/// @dev Phase 3.5: Create orders, execute swaps, cancel orders on testnet.
+/// @dev Phase 3.13: Diagnostics, E2E debugging, pool state analysis.
 ///
 ///   Usage (pick one action at a time):
 ///
@@ -24,11 +26,19 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 ///
 ///   # Action 2: Execute a swap (trigger order fills)
 ///   forge script script/InteractSepolia.s.sol:ExecuteSwap \
-///     --rpc-url $SEPOLIA_RPC_URL --broadcast -vvvv
+///     --rpc-url $SEPOLIA_RPC_URL --broadcast --slow --with-gas-price 5000000000 -vvvv
 ///
 ///   # Action 3: Cancel an order
 ///   ORDER_ID=0 forge script script/InteractSepolia.s.sol:CancelOrder \
 ///     --rpc-url $SEPOLIA_RPC_URL --broadcast -vvvv
+///
+///   # Action 4: Read order statuses
+///   forge script script/InteractSepolia.s.sol:ReadStatus \
+///     --rpc-url $SEPOLIA_RPC_URL -vvvv
+///
+///   # Action 5: Diagnose pool state (tick, price, liquidity, linked list)
+///   forge script script/InteractSepolia.s.sol:ReadPoolState \
+///     --rpc-url $SEPOLIA_RPC_URL -vvvv
 ///
 ///   Prerequisites:
 ///   - SetupSepolia.s.sol already executed (tokens deployed, pool initialized, liquidity added)
@@ -38,10 +48,10 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 //  SHARED CONFIGURATION
 // ============================================================
 abstract contract SepoliaConfig is Script {
-    // --- Deployed addresses from Phase 3.3 + 3.4 ---
-    address constant HOOK = 0xF1825a46608cadA9AFc3290397Ba7C77797E4040;
-    address constant TOKEN0 = 0x7AfF4F1a79d86095A6E2eBEF1dcfF7c263e55970; // TTA (sorted)
-    address constant TOKEN1 = 0xc1Fb22AE10BDB0545737825998BE99569b64E931; // TTB (sorted)
+    // --- Phase 3.12 deployed addresses ---
+    address constant HOOK = 0x956624906911dDC739Fe893CeE1F80e5be934040;
+    address constant TOKEN0 = 0x8FAA958134e083c039F28bEf5d8412C5bE0Af6D2; // TTA (sorted)
+    address constant TOKEN1 = 0xD8cF0Ac35566E7ce7cB63237046040761F65ae09; // TTB (sorted)
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // --- Pool parameters (must match SetupSepolia) ---
@@ -125,7 +135,9 @@ contract CreateOrder is SepoliaConfig {
 ///         the price UP (making token0 more expensive), which should trigger
 ///         zeroForOne sell orders.
 contract ExecuteSwap is SepoliaConfig {
-    uint256 constant SWAP_AMOUNT = 50000 ether; // 500 TTB — достаточно для ~1-2% движения цены
+    // Phase 3.13: increased from 50k to 5M to guarantee price moves past 1.01
+    // Pool has 10M liquidity, so 5M swap = ~50% of pool → massive price impact
+    uint256 constant SWAP_AMOUNT = 1 ether;
 
     function run() external {
         uint256 pk = _deployerKey();
@@ -133,13 +145,11 @@ contract ExecuteSwap is SepoliaConfig {
 
         console2.log("=== Execute Swap (Sepolia) ===");
         console2.log("Deployer:", deployer);
-        console2.log("Swap: 500 TTB -> TTA (push price UP ~1-2%)");
+        console2.log("Swap:", SWAP_AMOUNT / 1 ether, "TTB -> TTA (push price UP)");
 
         vm.startBroadcast(pk);
 
         // Step 1: Deploy PoolSwapTest router
-        // NOTE: No canonical PoolSwapTest on Sepolia, so we deploy our own.
-        // This is a test helper from v4-core, safe for testnet use.
         PoolSwapTest swapRouter = new PoolSwapTest(IPoolManager(POOL_MANAGER));
         console2.log("SwapRouter deployed:", address(swapRouter));
 
@@ -159,7 +169,7 @@ contract ExecuteSwap is SepoliaConfig {
         IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
             zeroForOne: false, // sell token1 -> buy token0
             amountSpecified: -int256(SWAP_AMOUNT), // exact input
-            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1 // no price limit (buying token0 pushes price up)
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1 // no price limit
         });
 
         PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
@@ -173,12 +183,10 @@ contract ExecuteSwap is SepoliaConfig {
 
         console2.log("");
         console2.log("=== SWAP EXECUTED ===");
-        console2.log("Swapped 500 TTB -> TTA");
-        console2.log("Price should have moved UP");
-        console2.log("Any sell orders with triggerPrice <= new price should be filled");
+        console2.log("Swapped TTB -> TTA");
+        console2.log("Price should have moved UP significantly");
         console2.log("");
-        console2.log("Check order status with: cast call", HOOK);
-        console2.log("  'getOrder(uint256)(address,uint96,uint96,address,address,uint128,uint64,bool,bool)' <ORDER_ID>");
+        console2.log("Next: Run ReadPoolState to check new price, then ReadStatus for orders");
     }
 }
 
@@ -280,5 +288,138 @@ contract ReadStatus is SepoliaConfig {
         console2.log("TTB balance (deployer):", IERC20(TOKEN1).balanceOf(deployer));
         console2.log("TTA balance (hook):", IERC20(TOKEN0).balanceOf(HOOK));
         console2.log("TTB balance (hook):", IERC20(TOKEN1).balanceOf(HOOK));
+    }
+}
+
+// ============================================================
+//  DIAGNOSTIC: READ POOL STATE (Phase 3.13)
+// ============================================================
+/// @notice Read on-chain pool state: current tick, sqrtPriceX96, liquidity,
+///         linked list, and order eligibility.
+///   forge script script/InteractSepolia.s.sol:ReadPoolState \
+///     --rpc-url $SEPOLIA_RPC_URL -vvvv
+contract ReadPoolState is SepoliaConfig {
+    using StateLibrary for IPoolManager;
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
+    function run() external view {
+        console2.log("=== Pool State Diagnostic (Sepolia) ===");
+        console2.log("Hook:", HOOK);
+        console2.log("PoolManager:", POOL_MANAGER);
+        console2.log("TOKEN0:", TOKEN0);
+        console2.log("TOKEN1:", TOKEN1);
+
+        PoolKey memory poolKey = _buildPoolKey();
+        PoolId poolId = poolKey.toId();
+        console2.log("");
+        console2.log("PoolId (bytes32):");
+        console2.logBytes32(PoolId.unwrap(poolId));
+
+        // --- Slot0: tick, price, fees ---
+        (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee) =
+            IPoolManager(POOL_MANAGER).getSlot0(poolId);
+
+        console2.log("");
+        console2.log("--- Slot0 ---");
+        console2.log("sqrtPriceX96:", uint256(sqrtPriceX96));
+        console2.log("tick:", tick);
+        console2.log("protocolFee:", uint256(protocolFee));
+        console2.log("lpFee:", uint256(lpFee));
+
+        // --- Convert sqrtPriceX96 to 1e18-scaled price ---
+        // price = (sqrtPriceX96 / 2^96)^2
+        // Split to avoid overflow: sqrtPrice_1e9 = sqrtPriceX96 * 1e9 / 2^96
+        // Then: price_1e18 = sqrtPrice_1e9 * sqrtPrice_1e9
+        uint256 sqrtPrice_1e9 = 0;
+        uint256 price_1e18 = 0;
+
+        if (sqrtPriceX96 > 0) {
+            sqrtPrice_1e9 = (uint256(sqrtPriceX96) * 1e9) / (1 << 96);
+            price_1e18 = sqrtPrice_1e9 * sqrtPrice_1e9;
+
+            console2.log("");
+            console2.log("--- Derived Price ---");
+            console2.log("price_1e18:", price_1e18);
+            console2.log("(1.00 = 1000000000000000000)");
+            console2.log("(1.01 = 1010000000000000000)");
+            console2.log("(1.10 = 1100000000000000000)");
+
+            if (price_1e18 >= 1.01e18) {
+                console2.log(">>> PRICE ABOVE 1.01 - orders SHOULD execute <<<");
+            } else {
+                uint256 gap = 1.01e18 - price_1e18;
+                console2.log("Gap to 1.01 trigger:", gap);
+                console2.log(">>> PRICE BELOW 1.01 - need bigger swap <<<");
+            }
+        } else {
+            console2.log("WARNING: sqrtPriceX96 is 0 - pool may not be initialized");
+        }
+
+        // --- Liquidity ---
+        uint128 liquidity = IPoolManager(POOL_MANAGER).getLiquidity(poolId);
+        console2.log("");
+        console2.log("--- Liquidity ---");
+        console2.log("liquidity:", uint256(liquidity));
+
+        // --- Linked List State ---
+        LimitOrderHook hookContract = LimitOrderHook(HOOK);
+        int24 sentinelMin = hookContract.SENTINEL_MIN();
+        int24 sentinelMax = hookContract.SENTINEL_MAX();
+        int24 firstActive = hookContract.nextActiveTick(sentinelMin);
+        int24 lastActive = hookContract.prevActiveTick(sentinelMax);
+
+        console2.log("");
+        console2.log("--- Linked List ---");
+        if (firstActive == sentinelMax) {
+            console2.log("List: EMPTY (no active order ticks)");
+        } else {
+            console2.log("First active tick:", firstActive);
+            console2.log("Last active tick:", lastActive);
+
+            // Walk the list (up to 10 ticks)
+            int24 cursor = firstActive;
+            uint256 count = 0;
+            while (cursor != sentinelMax && count < 10) {
+                uint256[] memory idsAtTick = hookContract.getOrdersInTick(cursor);
+                console2.log("  tick:", int256(cursor)); console2.log("    orders:", idsAtTick.length);
+                cursor = hookContract.getNextActiveTick(cursor);
+                count++;
+            }
+        }
+
+        // --- Orders vs Current Price ---
+        uint256 nextId = hookContract.nextOrderId();
+        console2.log("");
+        console2.log("--- Order Eligibility ---");
+        console2.log("Total orders:", nextId);
+
+        for (uint256 i = 0; i < nextId && i < 5; i++) {
+            (
+                address creator,
+                uint96 amount0,
+                ,
+                , ,
+                uint128 triggerPrice,
+                ,
+                bool isFilled,
+                bool zeroForOne
+            ) = hookContract.orders(i);
+
+            console2.log("");
+            console2.log("Order", i);
+            console2.log("  creator:", creator);
+            console2.log("  filled:", isFilled);
+            console2.log("  zeroForOne:", zeroForOne);
+            console2.log("  amount0:", uint256(amount0));
+            console2.log("  triggerPrice:", uint256(triggerPrice));
+
+            if (price_1e18 > 0 && !isFilled) {
+                bool eligible = zeroForOne
+                    ? (price_1e18 >= uint256(triggerPrice))
+                    : (price_1e18 <= uint256(triggerPrice));
+                console2.log("  >>> ELIGIBLE:", eligible);
+            }
+        }
     }
 }

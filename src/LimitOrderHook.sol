@@ -22,31 +22,32 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// @notice Allows users to place limit orders that execute automatically when
 ///         the pool price reaches a specified trigger price during swaps.
 ///
-/// @dev Architecture Overview (Phase 3.10 - afterSwap migration):
+/// @dev Architecture Overview (Phase 3.12 - Dynamic Tick Tracking):
 ///
-///   **Tick Bucket Indexing (O(1) Lookup)**
-///   Orders are indexed by their aligned tick in `tickToOrders` mapping.
-///   When a swap occurs, only ticks within the crossed range are scanned.
+///   **Sorted Linked List of Active Ticks**
+///   Instead of blindly scanning MAX_TICK_SCAN consecutive tick buckets (which
+///   wastes gas on empty ticks and fails for large price movements), we maintain
+///   a sorted doubly-linked list of only those ticks that actually contain orders.
+///
+///   Storage layout:
+///     - `nextActiveTick[tick]` → next higher active tick (or SENTINEL_MAX)
+///     - `prevActiveTick[tick]` → next lower active tick (or SENTINEL_MIN)
+///     - Two sentinel values anchor the list boundaries
+///
+///   This gives us:
+///     - O(1) insertion: given the sorted position (found via binary hint or walk)
+///     - O(1) removal: unlink node when its bucket becomes empty
+///     - O(K) scan during afterSwap: iterate only K populated ticks, skipping
+///       all empty space regardless of how far the price has moved
 ///
 ///   **afterSwap Execution**
 ///   Execution happens in `afterSwap`, AFTER the user's swap has moved the price.
-///   This ensures the hook sees the real post-swap price and can correctly determine
-///   which orders are now eligible. The hook then executes its own internal swaps
-///   via poolManager.swap() to fill each eligible order.
-///
-///   **Why afterSwap instead of beforeSwap?**
-///   In beforeSwap, the pool price hasn't changed yet, so orders above/below the
-///   current price can never be detected as eligible. afterSwap sees the actual
-///   post-swap price, solving this fundamental timing issue.
-///
-///   **Lazy Cleanup**
-///   Filled and cancelled orders are removed from tick buckets during iteration
-///   (swap-and-pop), amortizing cleanup cost across future swaps.
+///   The hook reads the post-swap tick, then walks the linked list from the
+///   current tick in the appropriate direction to find and execute eligible orders.
 ///
 ///   **Gas Metering (DoS Protection)**
-///   A two-level `gasleft()` check prevents out-of-gas reverts when many orders
-///   are queued. Execution stops gracefully; remaining orders persist for the
-///   next swap.
+///   A `gasleft()` check prevents out-of-gas reverts when many orders are queued.
+///   Execution stops gracefully; remaining orders persist for the next swap.
 ///
 ///   **Security**
 ///   - ReentrancyGuard on createLimitOrder and cancelOrder (ERC-777 defense)
@@ -94,11 +95,6 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Packed limit order structure (4 storage slots)
-    /// @dev Slot packing:
-    ///   slot 0: creator (20 bytes) + amount0 (12 bytes)
-    ///   slot 1: amount1 (12 bytes) + token0 (20 bytes)
-    ///   slot 2: token1 (20 bytes) - padded
-    ///   slot 3: triggerPrice (16 bytes) + createdAt (8 bytes) + isFilled (1 byte) + zeroForOne (1 byte)
     struct LimitOrder {
         address creator;
         uint96 amount0;
@@ -131,31 +127,47 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @notice Reverse mapping: orderId -> aligned tick bucket
     mapping(uint256 => int24) private orderTickBucket;
 
-    /// @dev Reentrancy guard for execution - prevents recursive execution during
-    ///      PoolManager callbacks triggered by order settlement.
-    ///      Separate from ReentrancyGuard which protects external entry points.
+    /*//////////////////////////////////////////////////////////////
+                    SORTED LINKED LIST OF ACTIVE TICKS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Sentinel values for linked list boundaries
+    /// @dev These are beyond Uniswap's tick range (±887272) and serve as
+    ///      permanent anchors. SENTINEL_MIN.next = first real tick,
+    ///      SENTINEL_MAX.prev = last real tick.
+    int24 public constant SENTINEL_MIN = type(int24).min; // -8388608
+    int24 public constant SENTINEL_MAX = type(int24).max; //  8388607
+
+    /// @notice Forward pointer: tick -> next higher active tick
+    mapping(int24 => int24) public nextActiveTick;
+
+    /// @notice Backward pointer: tick -> next lower active tick
+    mapping(int24 => int24) public prevActiveTick;
+
+    /// @notice Quick check: does this tick have orders?
+    /// @dev True when tickToOrders[tick].length > 0 AND tick is linked.
+    ///      Prevents double-insertion and enables O(1) removal check.
+    mapping(int24 => bool) public isActiveTick;
+
+    /// @dev Reentrancy guard for execution
     bool private isExecuting;
 
-    /// @notice Maximum tick buckets to scan per swap (gas safety)
-    /// @dev With tickSpacing=60, 100 buckets covers a 6000-tick range.
-    int24 public constant MAX_TICK_SCAN = 100;
+    /// @notice Maximum number of *populated* ticks to process per swap
+    /// @dev Unlike the old MAX_TICK_SCAN which counted empty ticks too,
+    ///      this counts only ticks that actually have orders. 100 populated
+    ///      ticks is generous — most swaps will encounter 1-5.
+    int24 public constant MAX_ACTIVE_TICK_SCAN = 100;
 
     /// @notice Minimum gas required to attempt executing one more order
-    /// @dev Empirically measured: ~100k gas per order execution (settle + take + SSTORE).
-    ///      150k threshold leaves buffer for completing the current execution and
-    ///      returning from the hook.
     uint256 public constant GAS_LIMIT_PER_ORDER = 150_000;
 
     /// @notice Maximum allowed slippage in basis points (50 = 0.5%)
-    /// @dev Orders that receive less than (triggerPrice * (10000 - MAX_SLIPPAGE_BPS) / 10000)
-    ///      will be skipped rather than executed at a bad price.
     uint256 public constant MAX_SLIPPAGE_BPS = 50;
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Emitted when a new limit order is created
     event OrderCreated(
         uint256 indexed orderId,
         address indexed creator,
@@ -164,10 +176,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         uint128 triggerPrice
     );
 
-    /// @notice Emitted when an order is cancelled and tokens returned
     event OrderCancelled(uint256 indexed orderId, address indexed creator);
 
-    /// @notice Emitted when an order is filled during a swap
     event OrderFilled(
         uint256 indexed orderId,
         address indexed creator,
@@ -185,7 +195,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     constructor(IPoolManager _poolManager, address _initialOwner)
         BaseHook(_poolManager)
         Ownable(_initialOwner)
-    {}
+    {
+        // Initialize sentinel linked list: SENTINEL_MIN <-> SENTINEL_MAX
+        nextActiveTick[SENTINEL_MIN] = SENTINEL_MAX;
+        prevActiveTick[SENTINEL_MAX] = SENTINEL_MIN;
+    }
 
     /*//////////////////////////////////////////////////////////////
                           HOOK CONFIG
@@ -223,7 +237,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
     /// @notice Create a new limit order with token custody
     /// @dev Transfers the input token from the caller to this contract.
-    ///      The order is indexed by its aligned tick for O(1) lookup.
+    ///      The order is indexed by its aligned tick and inserted into the
+    ///      sorted active tick linked list for efficient scanning.
     ///      Protected by ReentrancyGuard against ERC-777 callbacks.
     /// @param poolKey The Uniswap V4 pool to associate the order with
     /// @param zeroForOne True = selling token0 for token1; False = buying token0 with token1
@@ -238,7 +253,6 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     ) external nonReentrant returns (uint256 orderId) {
         if (amountIn == 0) revert InvalidAmount();
         if (triggerPrice == 0) revert InvalidTriggerPrice();
-        // M-2: Validate pool key
         if (poolKey.tickSpacing <= 0) revert InvalidPoolKey();
 
         orderId = nextOrderId++;
@@ -267,7 +281,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
         userOrders[msg.sender].push(orderId);
 
-        // Index by tick bucket for O(1) lookup
+        // Index by tick bucket
         int24 alignedTick = _alignTick(
             TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(triggerPrice)),
             poolKey.tickSpacing
@@ -275,11 +289,17 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         tickToOrders[alignedTick].push(orderId);
         orderTickBucket[orderId] = alignedTick;
 
+        // Insert tick into sorted linked list if not already active
+        if (!isActiveTick[alignedTick]) {
+            _insertActiveTick(alignedTick);
+        }
+
         emit OrderCreated(orderId, msg.sender, zeroForOne, amountIn, triggerPrice);
     }
 
     /// @notice Cancel an active order and return deposited tokens
-    /// @dev Removes the order from its tick bucket and refunds the creator.
+    /// @dev Removes the order from its tick bucket. If the bucket becomes empty,
+    ///      removes the tick from the active linked list.
     ///      Protected by ReentrancyGuard against ERC-777 callbacks.
     /// @param orderId The ID of the order to cancel
     function cancelOrder(uint256 orderId) external nonReentrant {
@@ -296,6 +316,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 _removeFromArray(orderIds, i);
                 break;
             }
+        }
+
+        // If tick bucket is now empty, remove from linked list
+        if (tickToOrders[tick].length == 0) {
+            _removeActiveTick(tick);
         }
 
         // Return tokens
@@ -335,18 +360,21 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         return orderTickBucket[orderId];
     }
 
+    /// @notice Get the next active tick above the given tick
+    function getNextActiveTick(int24 tick) external view returns (int24) {
+        return nextActiveTick[tick];
+    }
+
+    /// @notice Get the next active tick below the given tick
+    function getPrevActiveTick(int24 tick) external view returns (int24) {
+        return prevActiveTick[tick];
+    }
+
     /*//////////////////////////////////////////////////////////////
                         EXECUTION LOGIC
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Hook callback - executes eligible limit orders AFTER each swap
-    /// @dev Called by PoolManager after the swap has completed and price has moved.
-    ///      Reads the new post-swap price, scans tick buckets between the pre-swap
-    ///      and post-swap ticks, and executes matching orders.
-    ///
-    ///      Phase 3.10: Migrated from beforeSwap to afterSwap to solve the
-    ///      fundamental timing issue where beforeSwap sees pre-swap price and
-    ///      cannot detect orders that become eligible after the price moves.
     function _afterSwap(
         address,
         PoolKey calldata poolKey,
@@ -363,86 +391,121 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
         uint128 currentPrice = sqrtPriceToUint128(sqrtPriceX96);
 
-        // Execute matching orders
+        // Execute matching orders using the linked list
         _tryExecuteOrders(poolKey, currentPrice, params.zeroForOne);
 
         return (this.afterSwap.selector, 0);
     }
 
-    /// @notice Scan tick buckets directionally and execute eligible orders
-    /// @dev Scans from the current (post-swap) tick in the direction where
-    ///      eligible orders are likely to be found:
-    ///      - !zeroForOne swap (price went UP) -> scan downward for sell orders
-    ///        whose triggerPrice <= currentPrice (stored at lower ticks)
-    ///      - zeroForOne swap (price went DOWN) -> scan upward for buy orders
-    ///        whose triggerPrice >= currentPrice (stored at higher ticks)
-    ///      Gas-metered: stops after MAX_TICK_SCAN buckets or GAS_LIMIT_PER_ORDER.
-    ///      Lazy cleanup removes stale orders during iteration.
+    /// @notice Scan ONLY active (populated) ticks and execute eligible orders
+    /// @dev Instead of blindly iterating MAX_TICK_SCAN * tickSpacing range,
+    ///      we walk the sorted linked list of active ticks. This means:
+    ///      - Whale swaps that move price 50,000 ticks: still works (O(K) where K = populated ticks)
+    ///      - Sparse order book with 3 orders spread across 100,000 ticks: 3 iterations, not 100
+    ///
+    ///      Direction logic:
+    ///      - !zeroForOne swap (price UP) → scan downward for SELL orders (trigger when price >= X)
+    ///      - zeroForOne swap (price DOWN) → scan upward for BUY orders (trigger when price <= X)
     function _tryExecuteOrders(
         PoolKey calldata poolKey,
         uint128 currentPrice,
         bool swapZeroForOne
     ) internal {
-        int24 currentTick = TickMath.getTickAtSqrtPrice(uint128ToSqrtPrice(currentPrice));
-        int24 tickSpacing = poolKey.tickSpacing;
-        int24 alignedCurrentTick = _alignTick(currentTick, tickSpacing);
-
         address token0 = Currency.unwrap(poolKey.currency0);
 
-        // Determine scan direction based on swap direction:
-        // A !zeroForOne swap pushed price UP -> execute SELL orders (stored at lower ticks)
-        // A zeroForOne swap pushed price DOWN -> execute BUY orders (stored at higher ticks)
-        int24 scanStep = swapZeroForOne ? tickSpacing : -tickSpacing;
-        int24 tick = alignedCurrentTick;
+        int24 activeTickCount = 0;
 
-        for (int24 count = 0; count < MAX_TICK_SCAN; count++) {
+        if (swapZeroForOne) {
+            // Price went DOWN → scan upward for BUY orders (triggerPrice >= currentPrice)
+            // Start from the lowest active tick and go up
+            int24 tick = nextActiveTick[SENTINEL_MIN];
+
+            while (tick != SENTINEL_MAX && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
+                if (gasleft() < GAS_LIMIT_PER_ORDER) break;
+
+                // Cache next before potential removal
+                int24 nextTick = nextActiveTick[tick];
+
+                _processTickBucket(tick, token0, currentPrice, poolKey);
+
+                // If bucket is now empty after processing, remove from list
+                if (tickToOrders[tick].length == 0) {
+                    _removeActiveTick(tick);
+                }
+
+                activeTickCount++;
+                tick = nextTick;
+            }
+        } else {
+            // Price went UP → scan downward for SELL orders (triggerPrice <= currentPrice)
+            // Start from the highest active tick and go down
+            int24 tick = prevActiveTick[SENTINEL_MAX];
+
+            while (tick != SENTINEL_MIN && activeTickCount < MAX_ACTIVE_TICK_SCAN) {
+                if (gasleft() < GAS_LIMIT_PER_ORDER) break;
+
+                // Cache prev before potential removal
+                int24 prevTick = prevActiveTick[tick];
+
+                _processTickBucket(tick, token0, currentPrice, poolKey);
+
+                // If bucket is now empty after processing, remove from list
+                if (tickToOrders[tick].length == 0) {
+                    _removeActiveTick(tick);
+                }
+
+                activeTickCount++;
+                tick = prevTick;
+            }
+        }
+    }
+
+    /// @notice Process all orders in a single tick bucket
+    /// @dev Iterates orders in the bucket, executes eligible ones, performs
+    ///      lazy cleanup of filled/cancelled orders.
+    function _processTickBucket(
+        int24 tick,
+        address token0,
+        uint128 currentPrice,
+        PoolKey calldata poolKey
+    ) internal {
+        uint256[] storage orderIdsInTick = tickToOrders[tick];
+
+        uint256 i = 0;
+        while (i < orderIdsInTick.length) {
             if (gasleft() < GAS_LIMIT_PER_ORDER) break;
 
-            uint256[] storage orderIdsInTick = tickToOrders[tick];
+            uint256 orderId = orderIdsInTick[i];
+            LimitOrder storage order = orders[orderId];
 
-            if (orderIdsInTick.length > 0) {
-                uint256 i = 0;
-                while (i < orderIdsInTick.length) {
-                    if (gasleft() < GAS_LIMIT_PER_ORDER) break;
-
-                    uint256 orderId = orderIdsInTick[i];
-                    LimitOrder storage order = orders[orderId];
-
-                    // Lazy cleanup: remove filled/cancelled orders
-                    if (order.creator == address(0) || order.isFilled) {
-                        _removeFromArray(orderIdsInTick, i);
-                        continue;
-                    }
-
-                    // Skip if wrong pool
-                    if (order.token0 != token0) {
-                        i++;
-                        continue;
-                    }
-
-                    // Check price eligibility
-                    bool eligible = false;
-                    if (order.zeroForOne) {
-                        // Sell token0: trigger when price >= triggerPrice
-                        eligible = (currentPrice >= order.triggerPrice);
-                    } else {
-                        // Buy token0: trigger when price <= triggerPrice
-                        eligible = (currentPrice <= order.triggerPrice);
-                    }
-
-                    if (eligible) {
-                        _executeOrder(poolKey, order, orderId);
-                        _removeFromArray(orderIdsInTick, i);
-                    } else {
-                        i++;
-                    }
-                }
+            // Lazy cleanup: remove filled/cancelled orders
+            if (order.creator == address(0) || order.isFilled) {
+                _removeFromArray(orderIdsInTick, i);
+                continue;
             }
 
-            tick += scanStep;
+            // Skip if wrong pool
+            if (order.token0 != token0) {
+                i++;
+                continue;
+            }
 
-            // Safety: don't go beyond Uniswap's tick range
-            if (tick > TickMath.MAX_TICK || tick < TickMath.MIN_TICK) break;
+            // Check price eligibility
+            bool eligible = false;
+            if (order.zeroForOne) {
+                // Sell token0: trigger when price >= triggerPrice
+                eligible = (currentPrice >= order.triggerPrice);
+            } else {
+                // Buy token0: trigger when price <= triggerPrice
+                eligible = (currentPrice <= order.triggerPrice);
+            }
+
+            if (eligible) {
+                _executeOrder(poolKey, order, orderId);
+                _removeFromArray(orderIdsInTick, i);
+            } else {
+                i++;
+            }
         }
     }
 
@@ -453,8 +516,6 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     ///      3. Settle input tokens (sync + transfer + settle)
     ///      4. Take output tokens for the order creator
     ///      5. Validate slippage and mark order as filled
-    ///
-    ///      Uses SafeCast for all uint256->uint96/uint128/uint160 conversions.
     function _executeOrder(
         PoolKey calldata poolKey,
         LimitOrder storage order,
@@ -484,18 +545,16 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
         // Settle input + Take output
         if (order.zeroForOne) {
-            // Selling token0 for token1
             poolManager.sync(poolKey.currency0);
             IERC20(order.token0).safeTransfer(address(poolManager), uint256(amountIn));
             poolManager.settle();
 
-            // Extract amountOut from swap delta
             int128 deltaAmount1 = swapDelta.amount1();
             uint256 amountOut = deltaAmount1 < 0
                 ? uint256(uint128(-deltaAmount1))
                 : uint256(uint128(deltaAmount1));
 
-            // H-1/H-2 FIX: Slippage protection
+            // Slippage protection
             uint256 expectedOut = (uint256(amountIn) * uint256(order.triggerPrice)) / 1e18;
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
@@ -509,7 +568,6 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             order.isFilled = true;
             order.amount1 = amountOut.toUint96();
         } else {
-            // Buying token0 with token1
             poolManager.sync(poolKey.currency1);
             IERC20(order.token1).safeTransfer(address(poolManager), uint256(amountIn));
             poolManager.settle();
@@ -519,7 +577,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 ? uint256(uint128(-deltaAmount0))
                 : uint256(uint128(deltaAmount0));
 
-            // H-1/H-2 FIX: Slippage protection
+            // Slippage protection
             uint256 expectedOut = (uint256(amountIn) * 1e18) / uint256(order.triggerPrice);
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
@@ -546,26 +604,70 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     }
 
     /*//////////////////////////////////////////////////////////////
+                   SORTED LINKED LIST OPERATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Insert a tick into the sorted doubly-linked list
+    /// @dev Walks forward from SENTINEL_MIN to find the correct sorted position.
+    ///      For most use cases (few dozen active ticks), this is cheap.
+    ///      Worst case: O(N) where N = number of active ticks.
+    ///      Could be optimized with a hint parameter if needed for >1000 active ticks.
+    function _insertActiveTick(int24 tick) internal {
+        // Walk from the lowest sentinel to find insertion point
+        int24 cursor = SENTINEL_MIN;
+        while (nextActiveTick[cursor] != SENTINEL_MAX && nextActiveTick[cursor] < tick) {
+            cursor = nextActiveTick[cursor];
+        }
+
+        // Insert between cursor and cursor.next
+        // Before: cursor <-> cursorNext
+        // After:  cursor <-> tick <-> cursorNext
+        int24 cursorNext = nextActiveTick[cursor];
+
+        nextActiveTick[cursor] = tick;
+        prevActiveTick[tick] = cursor;
+        nextActiveTick[tick] = cursorNext;
+        prevActiveTick[cursorNext] = tick;
+
+        isActiveTick[tick] = true;
+    }
+
+    /// @notice Remove a tick from the sorted doubly-linked list
+    /// @dev O(1) operation — just unlink the node.
+    function _removeActiveTick(int24 tick) internal {
+        if (!isActiveTick[tick]) return;
+
+        int24 prev = prevActiveTick[tick];
+        int24 next = nextActiveTick[tick];
+
+        // Before: prev <-> tick <-> next
+        // After:  prev <-> next
+        nextActiveTick[prev] = next;
+        prevActiveTick[next] = prev;
+
+        // Clean up
+        delete nextActiveTick[tick];
+        delete prevActiveTick[tick];
+        isActiveTick[tick] = false;
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         PRICE HELPERS
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Convert sqrtPriceX96 (Uniswap format) to uint128 price scaled to 1e18
-    /// @dev Formula: price = (sqrtPriceX96^2 / 2^192) * 1e18
     function sqrtPriceToUint128(uint160 sqrtPriceX96) public pure returns (uint128 price) {
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         uint256 priceX96 = (sqrtPrice * sqrtPrice) / (1 << 96);
         uint256 priceScaled = (priceX96 * 1e18) / (1 << 96);
-        // SafeCast: uint256 -> uint128
         price = priceScaled.toUint128();
     }
 
     /// @notice Convert uint128 price (1e18 scaled) to sqrtPriceX96
-    /// @dev Inverse of sqrtPriceToUint128. Used for tick bucket indexing.
     function uint128ToSqrtPrice(uint128 price) public pure returns (uint160 sqrtPriceX96) {
         uint256 priceX192 = (uint256(price) * (1 << 96)) / 1e18;
         uint256 priceX96Full = priceX192 * (1 << 96);
         uint256 sqrtPriceRaw = sqrt(priceX96Full);
-        // SafeCast: uint256 -> uint160
         sqrtPriceX96 = sqrtPriceRaw.toUint160();
     }
 
