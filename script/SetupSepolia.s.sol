@@ -26,7 +26,7 @@ contract SetupSepolia is Script {
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // Phase 3.7: Updated to redeployed hook (directional tick scanning fix)
-    address constant HOOK = 0x43BF7DA3d2e26D295a8965109505767e93B24040;
+    address constant HOOK_ADDRESS = 0x43BF7DA3d2e26D295a8965109505767e93B24040;
 
     // Pool parameters
     int24 constant TICK_SPACING = 60;
