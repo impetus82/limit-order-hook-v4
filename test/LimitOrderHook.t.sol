@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console2} from "forge-std/Test.sol";
 import {LimitOrderHook} from "../src/LimitOrderHook.sol";
-import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
-/// @notice Unit tests for LimitOrderHook (no pool manager needed)
-/// @dev Testing price conversion, order matching logic, and hook permissions
+/// @title Unit tests for LimitOrderHook (no deployment required)
+/// @dev Tests pure functions and struct packing directly
 contract LimitOrderHookTest is Test {
-    
+
     /*//////////////////////////////////////////////////////////////
-                        PHASE 1: PRICE CONVERSION TESTS
+                        PRICE MATH TESTS
     //////////////////////////////////////////////////////////////*/
-    
+
     function testSqrtPriceConversion() public pure {
-        // Test case 1: sqrtPriceX96 for price = 1.0
-        uint160 sqrtPriceX96For1 = 79228162514264337593543950336;
-        uint128 price1 = _sqrtPriceToUint128(sqrtPriceX96For1);
-        assertApproxEqRel(price1, 1e18, 0.01e18);
+        // Test price = 1.0
+        uint160 sqrtPriceX96_1_0 = 79228162514264337593543950336; // sqrt(1) * 2^96
+        uint128 price1 = _sqrtPriceToUint128(sqrtPriceX96_1_0);
+        assertApproxEqRel(price1, 1e18, 0.01e18, "Price ~1.0");
         
-        // Test case 2: sqrtPriceX96 for price = 4.0
-        uint160 sqrtPriceX96For4 = 158456325028528675187087900672;
-        uint128 price4 = _sqrtPriceToUint128(sqrtPriceX96For4);
-        assertApproxEqRel(price4, 4e18, 0.01e18);
+        // Test price = 4.0
+        uint160 sqrtPriceX96_4_0 = 158456325028528675187087900672; // sqrt(4) * 2^96
+        uint128 price4 = _sqrtPriceToUint128(sqrtPriceX96_4_0);
+        assertApproxEqRel(price4, 4e18, 0.01e18, "Price ~4.0");
     }
 
     /*//////////////////////////////////////////////////////////////
-                        PHASE 2: ORDER MATCHING LOGIC TESTS
+                        ELIGIBILITY LOGIC TESTS
     //////////////////////////////////////////////////////////////*/
-    
+
     function testOrderEligibilityLogic() public pure {
         uint128 triggerPrice = 2000e18;
         

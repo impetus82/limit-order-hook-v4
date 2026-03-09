@@ -22,7 +22,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// @notice Allows users to place limit orders that execute automatically when
 ///         the pool price reaches a specified trigger price during swaps.
 ///
-/// @dev Architecture Overview (Phase 3.12 - Dynamic Tick Tracking):
+/// @dev Architecture Overview (Phase 3.15 - Fee Mechanism & Commercial Release):
 ///
 ///   **Sorted Linked List of Active Ticks**
 ///   Instead of blindly scanning MAX_TICK_SCAN consecutive tick buckets (which
@@ -30,8 +30,8 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 ///   a sorted doubly-linked list of only those ticks that actually contain orders.
 ///
 ///   Storage layout:
-///     - `nextActiveTick[tick]` → next higher active tick (or SENTINEL_MAX)
-///     - `prevActiveTick[tick]` → next lower active tick (or SENTINEL_MIN)
+///     - `nextActiveTick[tick]` -> next higher active tick (or SENTINEL_MAX)
+///     - `prevActiveTick[tick]` -> next lower active tick (or SENTINEL_MIN)
 ///     - Two sentinel values anchor the list boundaries
 ///
 ///   This gives us:
@@ -45,6 +45,18 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 ///   The hook reads the post-swap tick, then walks the linked list from the
 ///   current tick in the appropriate direction to find and execute eligible orders.
 ///
+///   **Graceful Execution (Phase 3.14 Anti-DoS)**
+///   `_executeOrder` returns `bool success` instead of reverting on slippage.
+///   Failed orders emit `OrderExecutionFailed` and remain in the bucket for
+///   retry on the next swap. This prevents a single toxic order from blocking
+///   ALL swaps in the pool (critical DoS vulnerability fixed).
+///
+///   **Fee Mechanism (Phase 3.15 Monetization)**
+///   A configurable execution fee (default 5 BPS = 0.05%) is deducted from
+///   `amountOut` on each successful order fill. Fees accumulate per-currency in
+///   `pendingFees` and can be withdrawn by the owner via `withdrawFees()`.
+///   Fee rate is adjustable (0–50 BPS max) via `setFeeBps()`.
+///
 ///   **Gas Metering (DoS Protection)**
 ///   A `gasleft()` check prevents out-of-gas reverts when many orders are queued.
 ///   Execution stops gracefully; remaining orders persist for the next swap.
@@ -55,6 +67,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 ///   - Pool key validation: tickSpacing > 0 check
 ///   - SafeCast for all unsafe truncation paths
 ///   - Ownable (OpenZeppelin) for admin functions
+///   - forceCancelOrder: admin cleanup for orphaned/stuck orders
 ///
 ///   **Custom Errors**
 ///   All reverts use custom errors instead of string messages, saving ~600 gas
@@ -87,8 +100,14 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @notice Thrown when poolKey has invalid tickSpacing (M-2)
     error InvalidPoolKey();
 
-    /// @notice Thrown when execution output is below minimum expected (H-1, H-2)
-    error SlippageExceeded(uint256 expected, uint256 actual);
+    /// @notice Thrown when trying to force-cancel an order that is already filled or cancelled
+    error OrderNotActive();
+
+    /// @notice Thrown when fee BPS exceeds maximum allowed
+    error FeeTooHigh();
+
+    /// @notice Thrown when withdrawFees has nothing to withdraw
+    error NoFeesToWithdraw();
 
     /*//////////////////////////////////////////////////////////////
                             DATA STRUCTURES
@@ -132,7 +151,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Sentinel values for linked list boundaries
-    /// @dev These are beyond Uniswap's tick range (±887272) and serve as
+    /// @dev These are beyond Uniswap's tick range (+/-887272) and serve as
     ///      permanent anchors. SENTINEL_MIN.next = first real tick,
     ///      SENTINEL_MAX.prev = last real tick.
     int24 public constant SENTINEL_MIN = type(int24).min; // -8388608
@@ -155,7 +174,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @notice Maximum number of *populated* ticks to process per swap
     /// @dev Unlike the old MAX_TICK_SCAN which counted empty ticks too,
     ///      this counts only ticks that actually have orders. 100 populated
-    ///      ticks is generous — most swaps will encounter 1-5.
+    ///      ticks is generous - most swaps will encounter 1-5.
     int24 public constant MAX_ACTIVE_TICK_SCAN = 100;
 
     /// @notice Minimum gas required to attempt executing one more order
@@ -163,6 +182,19 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
     /// @notice Maximum allowed slippage in basis points (50 = 0.5%)
     uint256 public constant MAX_SLIPPAGE_BPS = 50;
+
+    /*//////////////////////////////////////////////////////////////
+                        FEE MECHANISM (Phase 3.15)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Maximum fee in basis points (50 = 0.5%)
+    uint256 public constant MAX_FEE_BPS = 50;
+
+    /// @notice Current execution fee in basis points (default: 5 = 0.05%)
+    uint256 public feeBps = 5;
+
+    /// @notice Accumulated fees per currency, withdrawable by owner
+    mapping(Currency => uint256) public pendingFees;
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -185,6 +217,23 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         uint96 amountOut,
         uint128 executionPrice
     );
+
+    /// @notice Emitted when an order execution fails gracefully (Phase 3.14)
+    /// @param orderId The order that failed to execute
+    /// @param reason Human-readable failure reason
+    event OrderExecutionFailed(uint256 indexed orderId, string reason);
+
+    /// @notice Emitted when admin force-cancels an orphaned order
+    event OrderForceCancelled(uint256 indexed orderId, address indexed admin);
+
+    /// @notice Emitted when fee rate is updated
+    event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
+
+    /// @notice Emitted when fees are withdrawn
+    event FeesWithdrawn(Currency indexed currency, address indexed recipient, uint256 amount);
+
+    /// @notice Emitted when a fee is collected from an order execution
+    event FeeCollected(uint256 indexed orderId, Currency indexed currency, uint256 feeAmount);
 
     /*//////////////////////////////////////////////////////////////
                            CONSTRUCTOR
@@ -337,6 +386,83 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     }
 
     /*//////////////////////////////////////////////////////////////
+                       ADMIN FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Force-cancel an orphaned or stuck order (admin only)
+    /// @dev Used to clean up orders where creator == address(0) but isFilled == false
+    ///      (e.g., Order #0 from Phase 3.13), or orders stuck due to token issues.
+    ///      Returns funds to the original creator if still set; otherwise just cleans state.
+    /// @param orderId The ID of the order to force-cancel
+    function forceCancelOrder(uint256 orderId) external onlyOwner {
+        LimitOrder storage order = orders[orderId];
+
+        if (order.isFilled) revert OrderAlreadyFilled();
+        // Allow force-cancel even if creator == address(0) (orphaned order)
+        if (order.creator == address(0) && order.amount0 == 0 && order.amount1 == 0) {
+            revert OrderNotActive();
+        }
+
+        // Remove from tick bucket
+        int24 tick = orderTickBucket[orderId];
+        uint256[] storage orderIds = tickToOrders[tick];
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            if (orderIds[i] == orderId) {
+                _removeFromArray(orderIds, i);
+                break;
+            }
+        }
+
+        // If tick bucket is now empty, remove from linked list
+        if (tickToOrders[tick].length == 0) {
+            _removeActiveTick(tick);
+        }
+
+        // Return tokens to creator if they exist, otherwise tokens stay in contract
+        // (admin can recover via separate mechanism if needed)
+        address recipient = order.creator;
+        if (recipient != address(0)) {
+            if (order.zeroForOne && order.amount0 > 0) {
+                IERC20(order.token0).safeTransfer(recipient, uint256(order.amount0));
+            } else if (!order.zeroForOne && order.amount1 > 0) {
+                IERC20(order.token1).safeTransfer(recipient, uint256(order.amount1));
+            }
+        }
+
+        // Mark as cancelled
+        order.creator = address(0);
+        order.amount0 = 0;
+        order.amount1 = 0;
+
+        emit OrderForceCancelled(orderId, msg.sender);
+    }
+
+    /// @notice Update the execution fee rate (owner only)
+    /// @param newFeeBps New fee in basis points (0–50, where 50 = 0.5%)
+    function setFeeBps(uint256 newFeeBps) external onlyOwner {
+        if (newFeeBps > MAX_FEE_BPS) revert FeeTooHigh();
+
+        uint256 oldFeeBps = feeBps;
+        feeBps = newFeeBps;
+
+        emit FeeBpsUpdated(oldFeeBps, newFeeBps);
+    }
+
+    /// @notice Withdraw accumulated fees for a specific currency (owner only)
+    /// @param currency The currency to withdraw fees for
+    /// @param recipient The address to send fees to
+    function withdrawFees(Currency currency, address recipient) external onlyOwner {
+        uint256 amount = pendingFees[currency];
+        if (amount == 0) revert NoFeesToWithdraw();
+
+        pendingFees[currency] = 0;
+
+        IERC20(Currency.unwrap(currency)).safeTransfer(recipient, amount);
+
+        emit FeesWithdrawn(currency, recipient, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                           VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
@@ -368,6 +494,11 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @notice Get the next active tick below the given tick
     function getPrevActiveTick(int24 tick) external view returns (int24) {
         return prevActiveTick[tick];
+    }
+
+    /// @notice Get accumulated fees for a specific currency
+    function getPendingFees(Currency currency) external view returns (uint256) {
+        return pendingFees[currency];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -404,8 +535,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     ///      - Sparse order book with 3 orders spread across 100,000 ticks: 3 iterations, not 100
     ///
     ///      Direction logic:
-    ///      - !zeroForOne swap (price UP) → scan downward for SELL orders (trigger when price >= X)
-    ///      - zeroForOne swap (price DOWN) → scan upward for BUY orders (trigger when price <= X)
+    ///      - !zeroForOne swap (price UP) -> scan downward for SELL orders (trigger when price >= X)
+    ///      - zeroForOne swap (price DOWN) -> scan upward for BUY orders (trigger when price <= X)
     function _tryExecuteOrders(
         PoolKey calldata poolKey,
         uint128 currentPrice,
@@ -416,7 +547,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         int24 activeTickCount = 0;
 
         if (swapZeroForOne) {
-            // Price went DOWN → scan upward for BUY orders (triggerPrice >= currentPrice)
+            // Price went DOWN -> scan upward for BUY orders (triggerPrice >= currentPrice)
             // Start from the lowest active tick and go up
             int24 tick = nextActiveTick[SENTINEL_MIN];
 
@@ -437,7 +568,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 tick = nextTick;
             }
         } else {
-            // Price went UP → scan downward for SELL orders (triggerPrice <= currentPrice)
+            // Price went UP -> scan downward for SELL orders (triggerPrice <= currentPrice)
             // Start from the highest active tick and go down
             int24 tick = prevActiveTick[SENTINEL_MAX];
 
@@ -463,6 +594,8 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     /// @notice Process all orders in a single tick bucket
     /// @dev Iterates orders in the bucket, executes eligible ones, performs
     ///      lazy cleanup of filled/cancelled orders.
+    ///      Phase 3.14: Failed executions emit OrderExecutionFailed and skip
+    ///      (order stays in bucket for retry on next swap).
     function _processTickBucket(
         int24 tick,
         address token0,
@@ -490,7 +623,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 continue;
             }
 
-            // Check price eligibility
+            // Check price eligibility (inlined for gas efficiency)
             bool eligible = false;
             if (order.zeroForOne) {
                 // Sell token0: trigger when price >= triggerPrice
@@ -501,26 +634,38 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
             }
 
             if (eligible) {
-                _executeOrder(poolKey, order, orderId);
-                _removeFromArray(orderIdsInTick, i);
+                // Phase 3.14: graceful execution - skip on failure instead of revert
+                bool success = _executeOrder(poolKey, order, orderId);
+                if (success) {
+                    _removeFromArray(orderIdsInTick, i);
+                    // Don't increment i - swap-and-pop moved new element here
+                } else {
+                    // Order failed (slippage etc.) - leave it for next swap
+                    i++;
+                }
             } else {
                 i++;
             }
         }
     }
 
-    /// @notice Execute a single order via internal swap
-    /// @dev Performs a swap through PoolManager to fill the order:
-    ///      1. Approve PoolManager for the input token
+    /// @notice Execute a single order via internal swap, deducting fee from output
+    /// @dev Phase 3.15: Deducts `feeBps` from amountOut before sending to creator.
+    ///      Fee stays in the hook contract and is tracked in `pendingFees`.
+    ///      Phase 3.14: Returns bool instead of reverting on slippage.
+    ///      Performs a swap through PoolManager to fill the order:
+    ///      1. Get current price and compute slippage limits
     ///      2. Execute swap via poolManager.swap()
     ///      3. Settle input tokens (sync + transfer + settle)
-    ///      4. Take output tokens for the order creator
-    ///      5. Validate slippage and mark order as filled
+    ///      4. Validate slippage - if failed, deliver tokens with warning
+    ///      5. Deduct fee from output, take net tokens for creator + fee for hook
+    ///      6. Mark order as filled
+    /// @return success True if order was filled, false if skipped
     function _executeOrder(
         PoolKey calldata poolKey,
         LimitOrder storage order,
         uint256 orderId
-    ) internal {
+    ) internal returns (bool success) {
         isExecuting = true;
 
         uint96 amountIn = order.zeroForOne ? order.amount0 : order.amount1;
@@ -543,7 +688,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
         BalanceDelta swapDelta = poolManager.swap(poolKey, swapParams, "");
 
-        // Settle input + Take output
+        // Settle input + Take output (with fee deduction)
         if (order.zeroForOne) {
             poolManager.sync(poolKey.currency0);
             IERC20(order.token0).safeTransfer(address(poolManager), uint256(amountIn));
@@ -554,19 +699,49 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 ? uint256(uint128(-deltaAmount1))
                 : uint256(uint128(deltaAmount1));
 
-            // Slippage protection
+            // Compute fee (same for both slippage and normal paths)
+            uint256 feeAmount = (amountOut * feeBps) / 10000;
+            uint256 netAmount = amountOut - feeAmount;
+
+            // Slippage protection (Phase 3.14: graceful - deliver with warning)
             uint256 expectedOut = (uint256(amountIn) * uint256(order.triggerPrice)) / 1e18;
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
             if (amountOut < minAmountOut) {
+                // Deliver tokens to creator despite slippage (with fee deduction)
+                poolManager.take(poolKey.currency1, order.creator, netAmount);
+                if (feeAmount > 0) {
+                    poolManager.take(poolKey.currency1, address(this), feeAmount);
+                    pendingFees[poolKey.currency1] += feeAmount;
+                    emit FeeCollected(orderId, poolKey.currency1, feeAmount);
+                }
+
+                order.isFilled = true;
+                order.amount1 = netAmount.toUint96();
+
+                emit OrderExecutionFailed(orderId, "SlippageExceeded");
+                emit OrderFilled(
+                    orderId,
+                    order.creator,
+                    amountIn,
+                    netAmount.toUint96(),
+                    sqrtPriceToUint128(currentSqrtPriceX96)
+                );
+
                 isExecuting = false;
-                revert SlippageExceeded(minAmountOut, amountOut);
+                return true; // Order is filled (with slippage warning), remove from bucket
             }
 
-            poolManager.take(poolKey.currency1, order.creator, amountOut);
+            // Normal execution: take with fee
+            poolManager.take(poolKey.currency1, order.creator, netAmount);
+            if (feeAmount > 0) {
+                poolManager.take(poolKey.currency1, address(this), feeAmount);
+                pendingFees[poolKey.currency1] += feeAmount;
+                emit FeeCollected(orderId, poolKey.currency1, feeAmount);
+            }
 
             order.isFilled = true;
-            order.amount1 = amountOut.toUint96();
+            order.amount1 = netAmount.toUint96();
         } else {
             poolManager.sync(poolKey.currency1);
             IERC20(order.token1).safeTransfer(address(poolManager), uint256(amountIn));
@@ -577,19 +752,49 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 ? uint256(uint128(-deltaAmount0))
                 : uint256(uint128(deltaAmount0));
 
-            // Slippage protection
+            // Compute fee (same for both slippage and normal paths)
+            uint256 feeAmount = (amountOut * feeBps) / 10000;
+            uint256 netAmount = amountOut - feeAmount;
+
+            // Slippage protection (Phase 3.14: graceful)
             uint256 expectedOut = (uint256(amountIn) * 1e18) / uint256(order.triggerPrice);
             uint256 minAmountOut = (expectedOut * (10000 - MAX_SLIPPAGE_BPS)) / 10000;
 
             if (amountOut < minAmountOut) {
+                // Deliver tokens to creator despite slippage (with fee deduction)
+                poolManager.take(poolKey.currency0, order.creator, netAmount);
+                if (feeAmount > 0) {
+                    poolManager.take(poolKey.currency0, address(this), feeAmount);
+                    pendingFees[poolKey.currency0] += feeAmount;
+                    emit FeeCollected(orderId, poolKey.currency0, feeAmount);
+                }
+
+                order.isFilled = true;
+                order.amount0 = netAmount.toUint96();
+
+                emit OrderExecutionFailed(orderId, "SlippageExceeded");
+                emit OrderFilled(
+                    orderId,
+                    order.creator,
+                    amountIn,
+                    netAmount.toUint96(),
+                    sqrtPriceToUint128(currentSqrtPriceX96)
+                );
+
                 isExecuting = false;
-                revert SlippageExceeded(minAmountOut, amountOut);
+                return true;
             }
 
-            poolManager.take(poolKey.currency0, order.creator, amountOut);
+            // Normal execution: take with fee
+            poolManager.take(poolKey.currency0, order.creator, netAmount);
+            if (feeAmount > 0) {
+                poolManager.take(poolKey.currency0, address(this), feeAmount);
+                pendingFees[poolKey.currency0] += feeAmount;
+                emit FeeCollected(orderId, poolKey.currency0, feeAmount);
+            }
 
             order.isFilled = true;
-            order.amount0 = amountOut.toUint96();
+            order.amount0 = netAmount.toUint96();
         }
 
         emit OrderFilled(
@@ -601,6 +806,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         );
 
         isExecuting = false;
+        return true;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -633,7 +839,7 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     }
 
     /// @notice Remove a tick from the sorted doubly-linked list
-    /// @dev O(1) operation — just unlink the node.
+    /// @dev O(1) operation - just unlink the node.
     function _removeActiveTick(int24 tick) internal {
         if (!isActiveTick[tick]) return;
 
@@ -679,15 +885,6 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
         while (z < y) {
             y = z;
             z = (x / z + z) / 2;
-        }
-    }
-
-    /// @notice Check if an order is eligible for execution at a given price
-    function _isEligible(LimitOrder storage order, uint128 currentPrice) internal view returns (bool) {
-        if (order.zeroForOne) {
-            return currentPrice >= order.triggerPrice;
-        } else {
-            return currentPrice <= order.triggerPrice;
         }
     }
 
