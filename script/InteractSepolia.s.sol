@@ -50,8 +50,8 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 abstract contract SepoliaConfig is Script {
     // --- Phase 3.12 deployed addresses ---
     address constant HOOK = 0x43BF7DA3d2e26D295a8965109505767e93B24040;
-    address constant TOKEN0 = 0x8FAA958134e083c039F28bEf5d8412C5bE0Af6D2; // TTA (sorted)
-    address constant TOKEN1 = 0xD8cF0Ac35566E7ce7cB63237046040761F65ae09; // TTB (sorted)
+    address constant TOKEN0 = 0x93345833027Ab2Ab863b812fA7cA9D5cfee883BC; // TTA (sorted)
+    address constant TOKEN1 = 0xcD11CC946B446088A987d3163E662C335C20d410; // TTB (sorted)
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // --- Pool parameters (must match SetupSepolia) ---
@@ -137,7 +137,7 @@ contract CreateOrder is SepoliaConfig {
 contract ExecuteSwap is SepoliaConfig {
     // Phase 3.13: increased from 50k to 5M to guarantee price moves past 1.01
     // Pool has 10M liquidity, so 5M swap = ~50% of pool → massive price impact
-    uint256 constant SWAP_AMOUNT = 1 ether;
+    uint256 constant SWAP_AMOUNT = 100_000 ether;
 
     function run() external {
         uint256 pk = _deployerKey();
