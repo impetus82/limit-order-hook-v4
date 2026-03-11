@@ -13,3 +13,5 @@ docs/
 # Dotenv file
 .env
 .env
+frontend/node_modules/
+frontend/.next/
