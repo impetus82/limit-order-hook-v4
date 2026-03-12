@@ -6,6 +6,7 @@ import { useReadContract, useAccount } from "wagmi";
 import { LIMIT_ORDER_HOOK } from "@/config/contracts";
 import CreateOrderForm from "@/components/CreateOrderForm";
 import OrderList from "@/components/OrderList";
+import PoolInfo from "@/components/PoolInfo";
 
 function Skeleton() {
   return (
@@ -55,6 +56,9 @@ export default function Home() {
             relayers, no trust assumptions.
           </p>
         </div>
+
+        {/* Live Pool Price — always visible (read-only, no wallet needed) */}
+        <PoolInfo />
 
         {/* Contract Status Card */}
         <div className="rounded-xl border border-gray-800 bg-gray-900 p-6">

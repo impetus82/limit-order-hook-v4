@@ -6,6 +6,41 @@ export const LIMIT_ORDER_HOOK = {
   abi: abiJson.abi,
 } as const;
 
+// ── Uniswap V4 StateView (Sepolia) ─────────────────────
+// StateView is a dedicated offchain-read contract that wraps
+// PoolManager's extsload calls via StateLibrary.
+// PoolManager itself does NOT expose getSlot0 in its ABI —
+// StateLibrary is an internal Solidity library that uses extsload.
+// For frontend reads, we MUST use StateView.
+export const STATE_VIEW = {
+  address: "0xe1dd9c3fa50edb962e442f60dfbc432e24537e4c" as const,
+  abi: [
+    {
+      name: "getSlot0",
+      type: "function",
+      stateMutability: "view",
+      inputs: [{ name: "poolId", type: "bytes32" }],
+      outputs: [
+        { name: "sqrtPriceX96", type: "uint160" },
+        { name: "tick", type: "int24" },
+        { name: "protocolFee", type: "uint24" },
+        { name: "lpFee", type: "uint24" },
+      ],
+    },
+    {
+      name: "getLiquidity",
+      type: "function",
+      stateMutability: "view",
+      inputs: [{ name: "poolId", type: "bytes32" }],
+      outputs: [{ name: "liquidity", type: "uint128" }],
+    },
+  ] as const,
+} as const;
+
+// ── Pool ID (keccak256 of PoolKey, from Phase 3 deploy) ─
+export const POOL_ID =
+  "0x4046753456f05d267d00e774203c9f5abbce1bea38753f50976564d667e110a2" as const;
+
 // ── Sepolia Pool Parameters ─────────────────────────────
 export const POOL_FEE = 3000;
 export const TICK_SPACING = 60;
@@ -26,8 +61,7 @@ export const TOKEN_TTB = {
 } as const;
 
 // currency0 < currency1 (sorted by address for Uniswap V4 PoolKey)
-// TTA (0x9334...) > TTB (0xcD11...) — need to verify sorting!
-// Actually: 0x9334... < 0xcD11... ✅ so currency0 = TTA, currency1 = TTB
+// TTA (0x9334...) < TTB (0xcD11...) ✅ so currency0 = TTA, currency1 = TTB
 export const POOL_KEY = {
   currency0: TOKEN_TTA.address,
   currency1: TOKEN_TTB.address,
