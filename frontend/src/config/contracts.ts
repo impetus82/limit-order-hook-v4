@@ -39,7 +39,7 @@ export const STATE_VIEW = {
 
 // ── Pool ID (keccak256 of PoolKey, from Phase 3 deploy) ─
 export const POOL_ID =
-  "0x4046753456f05d267d00e774203c9f5abbce1bea38753f50976564d667e110a2" as const;
+  "0xe3c209028461da8adcc98df49199e8b6c42b5051186c2d7c8ec1e97451955791" as const;
 
 // ── Sepolia Pool Parameters ─────────────────────────────
 export const POOL_FEE = 3000;
@@ -47,14 +47,14 @@ export const TICK_SPACING = 60;
 
 // ── Test Tokens (Phase 3.15 deploy) ─────────────────────
 export const TOKEN_TTA = {
-  address: "0x93345833027Ab2Ab863b812fA7cA9D5cfee883BC" as const,
+  address: "0x5367BdE916282818fa3EE2c27ecbC79672D364ed" as const,
   symbol: "TTA",
   name: "Test Token A",
   decimals: 18,
 } as const;
 
 export const TOKEN_TTB = {
-  address: "0xcD11CC946B446088A987d3163E662C335C20d410" as const,
+  address: "0xfa6b4B169D5BC4d12bD07B3f8230a619E3c1f20e" as const,
   symbol: "TTB",
   name: "Test Token B",
   decimals: 18,

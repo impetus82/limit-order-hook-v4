@@ -42,7 +42,10 @@ export default function OrderList({
     ...LIMIT_ORDER_HOOK,
     functionName: "getUserOrders",
     args: address ? [address] : undefined,
-    query: { enabled: !!address },
+    query: {
+      enabled: !!address,
+      refetchInterval: 12_000,
+    },
   });
 
   // Re-fetch when refetchKey changes (order created or cancelled)
@@ -75,7 +78,7 @@ export default function OrderList({
         </p>
       ) : (
         <div className="space-y-3">
-          {[...ids].reverse().map((id) => (
+          {ids.map((id) => (
             <OrderItem
               key={id.toString()}
               orderId={id}
@@ -100,57 +103,42 @@ function OrderItem({
   onCancelled: () => void;
 }) {
   const {
-    data: rawOrder,
+    data: orderRaw,
     isLoading,
     refetch: refetchOrder,
   } = useReadContract({
     ...LIMIT_ORDER_HOOK,
     functionName: "getOrder",
     args: [orderId],
+    query: { refetchInterval: 12_000 },
   });
 
-  // Re-fetch order details when parent key changes
+  // Re-fetch individual order when parent key changes
   useEffect(() => {
     refetchOrder();
   }, [refetchKey, refetchOrder]);
 
-  // ── Cancel logic ──────────────────────────────────────
-  const {
-    data: cancelTxHash,
-    writeContract: writeCancel,
-    error: cancelError,
-    reset: resetCancel,
-  } = useWriteContract();
-
-  const { isSuccess: cancelConfirmed, isLoading: cancelMining } =
-    useWaitForTransactionReceipt({ hash: cancelTxHash });
+  // ── Cancel TX flow ──────────────────────────────────
+  const { data: cancelHash, writeContract: cancelOrder } = useWriteContract();
+  const { isSuccess: cancelConfirmed } = useWaitForTransactionReceipt({
+    hash: cancelHash,
+  });
 
   useEffect(() => {
     if (cancelConfirmed) {
+      // Refetch THIS order first, THEN notify parent
       refetchOrder().then(() => onCancelled());
     }
-  }, [cancelConfirmed, onCancelled, refetchOrder]);
+  }, [cancelConfirmed, refetchOrder, onCancelled]);
 
-  function handleCancel() {
-    resetCancel();
-    writeCancel({
-      ...LIMIT_ORDER_HOOK,
-      functionName: "cancelOrder",
-      args: [orderId],
-    });
-  }
-
-  // ── Loading skeleton ──────────────────────────────────
   if (isLoading) {
-    return (
-      <div className="h-24 rounded-lg bg-gray-800 animate-pulse" />
-    );
+    return <div className="h-24 rounded-lg bg-gray-800 animate-pulse" />;
   }
 
-  const order = rawOrder as OrderData | undefined;
+  const order = orderRaw as OrderData | undefined;
   if (!order) return null;
 
-  // ── Determine status ──────────────────────────────────
+  // Determine status
   const status: OrderStatus =
     order.creator === zeroAddress
       ? "cancelled"
@@ -158,117 +146,89 @@ function OrderItem({
         ? "filled"
         : "active";
 
-  const direction = order.zeroForOne ? "Sell" : "Buy";
-  const dirColor = order.zeroForOne ? "text-red-400" : "text-emerald-400";
+  // Direction & amounts
+  const isSell = order.zeroForOne;
+  const directionLabel = isSell ? "Sell TTA → TTB" : "Buy TTA ← TTB";
+  const inputAmount = isSell ? order.amount0 : order.amount1;
+  const outputAmount = isSell ? order.amount1 : order.amount0;
+  const inputSymbol = isSell ? TOKEN_TTA.symbol : TOKEN_TTB.symbol;
+  const outputSymbol = isSell ? TOKEN_TTB.symbol : TOKEN_TTA.symbol;
 
-  const spendSymbol = order.zeroForOne ? TOKEN_TTA.symbol : TOKEN_TTB.symbol;
-  const amountIn = order.zeroForOne ? order.amount0 : order.amount1;
+  // Trigger price (stored as 1e18-scaled)
+  const triggerNum = Number(order.triggerPrice) / 1e18;
 
-  const timestamp = Number(order.createdAt);
-  const dateStr =
-    timestamp > 0
-      ? new Date(timestamp * 1000).toLocaleDateString("en-US", {
-          month: "short",
-          day: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        })
-      : "—";
+  const handleCancel = () => {
+    cancelOrder({
+      ...LIMIT_ORDER_HOOK,
+      functionName: "cancelOrder",
+      args: [orderId],
+    });
+  };
 
-  const cancelErrMsg = cancelError
-    ? cancelError.message.includes("User rejected") ||
-      cancelError.message.includes("user rejected")
-      ? "Rejected in wallet"
-      : "Cancel failed"
-    : null;
-
-  // ── Render ────────────────────────────────────────────
   return (
-    <div className="rounded-lg border border-gray-800 bg-gray-800/50 p-4 flex items-center justify-between gap-4">
-      {/* Left: Order info */}
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-xs font-mono text-gray-500">#{orderId.toString()}</span>
+    <div className="rounded-lg border border-gray-700 bg-gray-800/50 p-4">
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-500 font-mono">
+            #{orderId.toString()}
+          </span>
           <StatusBadge status={status} />
-          <span className={`text-xs font-medium ${dirColor}`}>{direction}</span>
         </div>
-
-        <div className="flex items-baseline gap-3 text-sm">
-          <span className="text-white font-mono">
-            {Number(formatEther(amountIn)).toFixed(4)}{" "}
-            <span className="text-gray-400">{spendSymbol}</span>
-          </span>
-          <span className="text-gray-600">@</span>
-          <span className="text-white font-mono">
-            {Number(formatEther(order.triggerPrice)).toFixed(4)}
-          </span>
-        </div>
-
-        <p className="text-xs text-gray-600 mt-1">{dateStr}</p>
-
-        {cancelErrMsg && (
-          <p className="text-xs text-red-400 mt-1">{cancelErrMsg}</p>
-        )}
+        <span className="text-xs text-gray-500">
+          {directionLabel}
+        </span>
       </div>
 
-      {/* Right: Cancel button (only for active orders) */}
+      {/* Details */}
+      <div className="grid grid-cols-2 gap-y-2 text-sm">
+        <span className="text-gray-500">Input</span>
+        <span className="text-right text-white font-mono">
+          {formatEther(inputAmount)} {inputSymbol}
+        </span>
+
+        {status === "filled" && outputAmount > 0n && (
+          <>
+            <span className="text-gray-500">Received</span>
+            <span className="text-right text-emerald-400 font-mono">
+              {formatEther(outputAmount)} {outputSymbol}
+            </span>
+          </>
+        )}
+
+        <span className="text-gray-500">Trigger</span>
+        <span className="text-right text-gray-300 font-mono">
+          ≥ {triggerNum.toFixed(4)}
+        </span>
+      </div>
+
+      {/* Cancel button */}
       {status === "active" && (
         <button
           onClick={handleCancel}
-          disabled={!!cancelTxHash && !cancelConfirmed}
-          className="shrink-0 px-3 py-1.5 rounded-md text-xs font-medium
-                     border border-gray-700 text-gray-400
-                     hover:border-red-500/50 hover:text-red-400 hover:bg-red-500/10
-                     disabled:opacity-50 disabled:cursor-not-allowed
-                     transition-colors"
+          disabled={!!cancelHash && !cancelConfirmed}
+          className="mt-3 w-full rounded-lg bg-red-900/30 border border-red-800/50 py-2 text-sm text-red-400 hover:bg-red-900/50 transition-colors disabled:opacity-50"
         >
-          {cancelMining ? (
-            <span className="inline-flex items-center gap-1.5">
-              <Spinner />
-              Cancelling…
-            </span>
-          ) : cancelConfirmed ? (
-            "Cancelled"
-          ) : (
-            "Cancel"
-          )}
+          {cancelHash && !cancelConfirmed ? "Cancelling…" : "Cancel Order"}
         </button>
       )}
     </div>
   );
 }
 
-// ── Status Badge ─────────────────────────────────────────
+// ── StatusBadge ─────────────────────────────────────────
 function StatusBadge({ status }: { status: OrderStatus }) {
   const styles: Record<OrderStatus, string> = {
-    active: "bg-yellow-500/15 text-yellow-400 border-yellow-500/30",
-    filled: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-    cancelled: "bg-gray-700/50 text-gray-500 border-gray-600/30",
+    active: "bg-blue-900/40 text-blue-400 border-blue-800/50",
+    filled: "bg-emerald-900/40 text-emerald-400 border-emerald-800/50",
+    cancelled: "bg-gray-800 text-gray-500 border-gray-700",
   };
 
   return (
     <span
-      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium uppercase tracking-wider border ${styles[status]}`}
+      className={`text-[11px] font-medium px-2 py-0.5 rounded-full border ${styles[status]}`}
     >
-      {status}
+      {status.charAt(0).toUpperCase() + status.slice(1)}
     </span>
-  );
-}
-
-// ── Tiny spinner ─────────────────────────────────────────
-function Spinner() {
-  return (
-    <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
-      <circle
-        cx="12" cy="12" r="10"
-        stroke="currentColor" strokeWidth="3"
-        className="opacity-25"
-      />
-      <path
-        d="M4 12a8 8 0 018-8"
-        stroke="currentColor" strokeWidth="3" strokeLinecap="round"
-        className="opacity-75"
-      />
-    </svg>
   );
 }

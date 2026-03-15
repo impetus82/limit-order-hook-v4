@@ -25,6 +25,7 @@ export default function PoolInfo() {
     ...STATE_VIEW,
     functionName: "getSlot0",
     args: [POOL_ID],
+    query: { refetchInterval: 12_000 },
   });
 
   // ── Loading ────────────────────────────────────────────
