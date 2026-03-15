@@ -48,10 +48,10 @@ import {LimitOrderHook} from "../src/LimitOrderHook.sol";
 //  SHARED CONFIGURATION
 // ============================================================
 abstract contract SepoliaConfig is Script {
-    // --- Phase 3.12 deployed addresses ---
+    // --- Phase 3.15 deployed addresses ---
     address constant HOOK = 0x43BF7DA3d2e26D295a8965109505767e93B24040;
-    address constant TOKEN0 = 0x93345833027Ab2Ab863b812fA7cA9D5cfee883BC; // TTA (sorted)
-    address constant TOKEN1 = 0xcD11CC946B446088A987d3163E662C335C20d410; // TTB (sorted)
+    address constant TOKEN0 = 0x5367BdE916282818fa3EE2c27ecbC79672D364ed; // TTA (sorted)
+    address constant TOKEN1 = 0xfa6b4B169D5BC4d12bD07B3f8230a619E3c1f20e; // TTB (sorted)
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
 
     // --- Pool parameters (must match SetupSepolia) ---

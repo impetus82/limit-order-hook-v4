@@ -24,3 +24,15 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Предотвращение горизонтального скролла на мобильных */
+html, body {
+  overflow-x: hidden;
+}
+
+/* Увеличенные touch-таргеты */
+@media (max-width: 640px) {
+  button, [role="button"] {
+    min-height: 44px;
+  }
+}

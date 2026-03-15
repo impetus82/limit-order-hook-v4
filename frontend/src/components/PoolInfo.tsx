@@ -113,11 +113,7 @@ export default function PoolInfo() {
           <div className="flex justify-between items-center">
             <span className="text-gray-400 text-sm">Price</span>
             <div className="text-right">
-              <span
-                className={`font-mono font-semibold ${
-                  extreme ? "text-yellow-400 text-base" : "text-white text-lg"
-                }`}
-              >
+              <span className={`font-mono font-semibold ${extreme ? "text-yellow-400 text-sm sm:text-base" : "text-white text-base sm:text-lg"}`}>
                 {priceForward}
               </span>
               <span className="text-gray-500 text-xs ml-1.5">TTB per TTA</span>

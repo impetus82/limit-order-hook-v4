@@ -239,10 +239,10 @@ export default function CreateOrderForm({
       </h3>
 
       {/* Direction Toggle */}
-      <div className="flex gap-2 mb-5">
+      <div className="flex gap-2 mb-4 sm:mb-5">
         <button
           onClick={() => setDirection("sell")}
-          className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${
+          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors ${
             direction === "sell"
               ? "bg-red-500/20 text-red-400 border border-red-500/40"
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
@@ -252,7 +252,7 @@ export default function CreateOrderForm({
         </button>
         <button
           onClick={() => setDirection("buy")}
-          className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${
+          className={`flex-1 py-2.5 sm:py-2 rounded-lg text-xs sm:text-sm font-medium transition-colors ${
             direction === "buy"
               ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
@@ -282,7 +282,7 @@ export default function CreateOrderForm({
               }
             }}
             disabled={txStep !== "idle"}
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white
+            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 sm:px-4 py-3 text-sm sm:text-base text-white
                        placeholder-gray-600 focus:outline-none focus:border-gray-500
                        disabled:opacity-50 font-mono"
           />
@@ -321,7 +321,7 @@ export default function CreateOrderForm({
             }
           }}
           disabled={txStep !== "idle"}
-          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white
+          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 sm:px-4 py-3 text-sm sm:text-base text-white
                      placeholder-gray-600 focus:outline-none focus:border-gray-500
                      disabled:opacity-50 font-mono"
         />

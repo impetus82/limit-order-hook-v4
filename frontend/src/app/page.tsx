@@ -23,11 +23,13 @@ export default function Home() {
   const { data: feeBps, isLoading: feeLoading, refetch: refetchFee } = useReadContract({
     ...LIMIT_ORDER_HOOK,
     functionName: "feeBps",
+    query: { refetchInterval: 12_000 },
   });
 
   const { data: nextOrderId, isLoading: orderLoading, refetch: refetchOrderCount } = useReadContract({
     ...LIMIT_ORDER_HOOK,
     functionName: "nextOrderId",
+    query: { refetchInterval: 12_000 },
   });
 
   const handleDataChanged = useCallback(() => {
@@ -38,19 +40,17 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-gray-950 text-white">
-      <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
-        <h1 className="text-xl font-bold tracking-tight">
+      <header className="flex flex-col sm:flex-row items-center justify-between gap-3 px-4 sm:px-6 py-3 sm:py-4 border-b border-gray-800">
+        <h1 className="text-lg sm:text-xl font-bold tracking-tight">
           Limit Order Hook
-          <span className="ml-2 text-xs font-normal text-gray-500">
-            Uniswap V4
-          </span>
+          <span className="ml-2 text-xs font-normal text-gray-500">Uniswap V4</span>
         </h1>
         <ConnectButton />
       </header>
 
-      <div className="max-w-2xl mx-auto mt-12 px-6 space-y-6">
+      <div className="max-w-2xl mx-auto mt-6 sm:mt-12 px-4 sm:px-6 space-y-4 sm:space-y-6">
         <div className="text-center mb-8">
-          <h2 className="text-3xl font-bold mb-3">On-chain Limit Orders</h2>
+          <h2 className="text-2xl sm:text-3xl font-bold mb-2 sm:mb-3">On-chain Limit Orders</h2>
           <p className="text-gray-400">
             Place limit orders directly on Uniswap V4 pools. No off-chain
             relayers, no trust assumptions.
@@ -67,9 +67,9 @@ export default function Home() {
           </h3>
 
           <div className="space-y-4">
-            <div className="flex justify-between items-center">
-              <span className="text-gray-400">Hook Address</span>
-              <code className="text-sm text-emerald-400 bg-gray-800 px-2 py-1 rounded">
+            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-1">
+              <span className="text-gray-400 text-sm">Hook Address</span>
+              <code className="text-xs sm:text-sm text-emerald-400 bg-gray-800 px-2 py-1 rounded break-all">
                 0x43BF...4040
               </code>
             </div>

@@ -181,7 +181,7 @@ function OrderItem({
       </div>
 
       {/* Details */}
-      <div className="grid grid-cols-2 gap-y-2 text-sm">
+      <div className="grid grid-cols-2 gap-y-1.5 sm:gap-y-2 text-xs sm:text-sm">
         <span className="text-gray-500">Input</span>
         <span className="text-right text-white font-mono">
           {formatEther(inputAmount)} {inputSymbol}
@@ -207,7 +207,7 @@ function OrderItem({
         <button
           onClick={handleCancel}
           disabled={!!cancelHash && !cancelConfirmed}
-          className="mt-3 w-full rounded-lg bg-red-900/30 border border-red-800/50 py-2 text-sm text-red-400 hover:bg-red-900/50 transition-colors disabled:opacity-50"
+          className="mt-3 w-full rounded-lg bg-red-900/30 border border-red-800/50 py-2.5 sm:py-2 text-sm text-red-400 hover:bg-red-900/50 transition-colors disabled:opacity-50"
         >
           {cancelHash && !cancelConfirmed ? "Cancelling…" : "Cancel Order"}
         </button>
