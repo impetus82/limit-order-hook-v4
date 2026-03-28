@@ -87,9 +87,9 @@ export default function PoolInfo() {
     <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
-          Pool Price — TTA / TTB
+          Pool Price — WETH / USDC
         </h3>
-        <span className="text-[10px] text-gray-600 font-mono">LIVE</span>
+        <span className="text-[10px] text-gray-600 font-mono">BASE • LIVE</span>
       </div>
 
       {isPoolEmpty ? (
@@ -109,25 +109,25 @@ export default function PoolInfo() {
             </div>
           )}
 
-          {/* Primary: TTB per TTA */}
+          {/* Primary: USDC per WETH */}
           <div className="flex justify-between items-center">
             <span className="text-gray-400 text-sm">Price</span>
             <div className="text-right">
               <span className={`font-mono font-semibold ${extreme ? "text-yellow-400 text-sm sm:text-base" : "text-white text-base sm:text-lg"}`}>
                 {priceForward}
               </span>
-              <span className="text-gray-500 text-xs ml-1.5">TTB per TTA</span>
+              <span className="text-gray-500 text-xs ml-1.5">USDC per WETH</span>
             </div>
           </div>
 
-          {/* Inverse: TTA per TTB */}
+          {/* Inverse: WETH per USDC */}
           <div className="flex justify-between items-center">
             <span className="text-gray-400 text-sm">Inverse</span>
             <div className="text-right">
               <span className="text-gray-300 font-mono text-sm">
                 {priceInverse}
               </span>
-              <span className="text-gray-500 text-xs ml-1.5">TTA per TTB</span>
+              <span className="text-gray-500 text-xs ml-1.5">WETH per USDC</span>
             </div>
           </div>
 

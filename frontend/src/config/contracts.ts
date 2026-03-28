@@ -1,19 +1,17 @@
 import abiJson from "./abi.json";
 
-// ── Hook Contract ───────────────────────────────────────
+// ── Hook Contract (Base Mainnet) ────────────────────────
 export const LIMIT_ORDER_HOOK = {
-  address: "0x43BF7DA3d2e26D295a8965109505767e93B24040" as const,
+  address: "0x02C72A5E1125AD6f4B8D71E87af14BC8663b0040" as const,
   abi: abiJson.abi,
 } as const;
 
-// ── Uniswap V4 StateView (Sepolia) ─────────────────────
+// ── Uniswap V4 StateView (Base Mainnet) ─────────────────
 // StateView is a dedicated offchain-read contract that wraps
 // PoolManager's extsload calls via StateLibrary.
-// PoolManager itself does NOT expose getSlot0 in its ABI —
-// StateLibrary is an internal Solidity library that uses extsload.
-// For frontend reads, we MUST use StateView.
+// Source: https://docs.uniswap.org/contracts/v4/deployments
 export const STATE_VIEW = {
-  address: "0xe1dd9c3fa50edb962e442f60dfbc432e24537e4c" as const,
+  address: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71" as const,
   abi: [
     {
       name: "getSlot0",
@@ -37,34 +35,41 @@ export const STATE_VIEW = {
   ] as const,
 } as const;
 
-// ── Pool ID (keccak256 of PoolKey, from Phase 3 deploy) ─
+// ── Pool ID ─────────────────────────────────────────────
+// TODO: Replace with actual PoolId from SetupBase.s.sol output!
+// Run the script, copy the logged bytes32 value here.
 export const POOL_ID =
-  "0xe3c209028461da8adcc98df49199e8b6c42b5051186c2d7c8ec1e97451955791" as const;
+  "0x9ab80bf349a3a10edc42141e23d29ab0cbaf02e7d43c75a3b30ebf0088faaa60" as const;
 
-// ── Sepolia Pool Parameters ─────────────────────────────
+// ── Base Mainnet Pool Parameters ────────────────────────
 export const POOL_FEE = 3000;
 export const TICK_SPACING = 60;
 
-// ── Test Tokens (Phase 3.15 deploy) ─────────────────────
-export const TOKEN_TTA = {
-  address: "0x5367BdE916282818fa3EE2c27ecbC79672D364ed" as const,
-  symbol: "TTA",
-  name: "Test Token A",
+// ── Real Tokens (Base Mainnet) ──────────────────────────
+// WETH: 0x4200... < USDC: 0x8335...  →  currency0 = WETH, currency1 = USDC
+export const TOKEN_WETH = {
+  address: "0x4200000000000000000000000000000000000006" as const,
+  symbol: "WETH",
+  name: "Wrapped Ether",
   decimals: 18,
 } as const;
 
-export const TOKEN_TTB = {
-  address: "0xfa6b4B169D5BC4d12bD07B3f8230a619E3c1f20e" as const,
-  symbol: "TTB",
-  name: "Test Token B",
-  decimals: 18,
+export const TOKEN_USDC = {
+  address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const,
+  symbol: "USDC",
+  name: "USD Coin",
+  decimals: 6,
 } as const;
+
+// Aliases matching old TTA/TTB pattern (currency0 = WETH, currency1 = USDC)
+export const TOKEN_0 = TOKEN_WETH;
+export const TOKEN_1 = TOKEN_USDC;
 
 // currency0 < currency1 (sorted by address for Uniswap V4 PoolKey)
-// TTA (0x9334...) < TTB (0xcD11...) ✅ so currency0 = TTA, currency1 = TTB
+// WETH (0x4200...) < USDC (0x8335...) ✅
 export const POOL_KEY = {
-  currency0: TOKEN_TTA.address,
-  currency1: TOKEN_TTB.address,
+  currency0: TOKEN_WETH.address,
+  currency1: TOKEN_USDC.address,
   fee: POOL_FEE,
   tickSpacing: TICK_SPACING,
   hooks: LIMIT_ORDER_HOOK.address,
@@ -114,3 +119,11 @@ export const ERC20_ABI = [
     outputs: [{ name: "", type: "uint8" }],
   },
 ] as const;
+
+// ── Legacy aliases for backward compatibility ───────────
+// Components that import TOKEN_TTA/TOKEN_TTB will still work
+export const TOKEN_TTA = TOKEN_WETH;
+export const TOKEN_TTB = TOKEN_USDC;
+
+// ── Block explorer base URL ─────────────────────────────
+export const EXPLORER_URL = "https://basescan.org";

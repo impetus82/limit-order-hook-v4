@@ -7,13 +7,14 @@ import {
   useWriteContract,
   useWaitForTransactionReceipt,
 } from "wagmi";
-import { parseEther, formatEther, type Address } from "viem";
+import { parseUnits, formatUnits, type Address } from "viem";
 import {
   LIMIT_ORDER_HOOK,
   ERC20_ABI,
-  TOKEN_TTA,
-  TOKEN_TTB,
+  TOKEN_0,
+  TOKEN_1,
   POOL_KEY,
+  EXPLORER_URL,
 } from "@/config/contracts";
 
 // ── Types ───────────────────────────────────────────────
@@ -40,9 +41,12 @@ export default function CreateOrderForm({
   const [error, setError] = useState<string | null>(null);
 
   // Derived: which token are we spending?
-  const spendToken = direction === "sell" ? TOKEN_TTA : TOKEN_TTB;
-  const receiveToken = direction === "sell" ? TOKEN_TTB : TOKEN_TTA;
-  const zeroForOne = direction === "sell"; // sell TTA (currency0) for TTB (currency1)
+  // currency0 = WETH, currency1 = USDC
+  // "sell" = sell WETH for USDC (zeroForOne=true)
+  // "buy"  = buy WETH with USDC (zeroForOne=false)
+  const spendToken = direction === "sell" ? TOKEN_0 : TOKEN_1;
+  const receiveToken = direction === "sell" ? TOKEN_1 : TOKEN_0;
+  const zeroForOne = direction === "sell";
 
   // ── Read: user balance ────────────────────────────────
   const { data: userBalance } = useReadContract({
@@ -88,20 +92,23 @@ export default function CreateOrderForm({
       hash: createTxHash,
     });
 
-  // ── Parsed amounts ────────────────────────────────────
+  // ── Parsed amounts (DECIMAL-AWARE) ────────────────────
+  // KEY CHANGE: Use parseUnits with token-specific decimals instead of parseEther
   const parsedAmount = useMemo(() => {
     try {
       if (!amountIn || parseFloat(amountIn) <= 0) return null;
-      return parseEther(amountIn);
+      return parseUnits(amountIn, spendToken.decimals);
     } catch {
       return null;
     }
-  }, [amountIn]);
+  }, [amountIn, spendToken.decimals]);
 
+  // Trigger price is always stored as uint128 scaled to 1e18 in the contract
+  // (contract uses its own internal price representation)
   const parsedTriggerPrice = useMemo(() => {
     try {
       if (!triggerPrice || parseFloat(triggerPrice) <= 0) return null;
-      return parseEther(triggerPrice);
+      return parseUnits(triggerPrice, 18);
     } catch {
       return null;
     }
@@ -248,7 +255,7 @@ export default function CreateOrderForm({
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
           }`}
         >
-          Sell TTA → TTB
+          Sell WETH → USDC
         </button>
         <button
           onClick={() => setDirection("buy")}
@@ -258,7 +265,7 @@ export default function CreateOrderForm({
               : "bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600"
           }`}
         >
-          Buy TTA ← TTB
+          Buy WETH ← USDC
         </button>
       </div>
 
@@ -274,7 +281,6 @@ export default function CreateOrderForm({
             placeholder="0.0"
             value={amountIn}
             onChange={(e) => {
-              // Allow only numbers and a single dot
               const val = e.target.value;
               if (/^[0-9]*\.?[0-9]*$/.test(val)) {
                 setAmountIn(val);
@@ -288,11 +294,15 @@ export default function CreateOrderForm({
           />
           {address && userBalance !== undefined && (
             <button
-              onClick={() => setAmountIn(formatEther(userBalance as bigint))}
+              onClick={() =>
+                setAmountIn(formatUnits(userBalance as bigint, spendToken.decimals))
+              }
               className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500
                          hover:text-gray-300 transition-colors"
             >
-              MAX: {Number(formatEther(userBalance as bigint)).toFixed(2)}
+              MAX: {Number(formatUnits(userBalance as bigint, spendToken.decimals)).toFixed(
+                spendToken.decimals === 6 ? 2 : 4
+              )}
             </button>
           )}
         </div>
@@ -306,12 +316,12 @@ export default function CreateOrderForm({
       {/* Trigger Price Input */}
       <div className="mb-5">
         <label className="block text-xs text-gray-500 mb-1.5">
-          Trigger Price ({receiveToken.symbol} per {spendToken.symbol})
+          Trigger Price (USDC per WETH)
         </label>
         <input
           type="text"
           inputMode="decimal"
-          placeholder="1.01"
+          placeholder="3600"
           value={triggerPrice}
           onChange={(e) => {
             const val = e.target.value;
@@ -343,12 +353,12 @@ export default function CreateOrderForm({
             </p>
             {createTxHash && (
               <a
-                href={`https://sepolia.etherscan.io/tx/${createTxHash}`}
+                href={`${EXPLORER_URL}/tx/${createTxHash}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-xs text-emerald-500/70 hover:text-emerald-400 underline mt-1 inline-block"
               >
-                View on Etherscan ↗
+                View on BaseScan ↗
               </a>
             )}
           </div>
@@ -382,7 +392,7 @@ export default function CreateOrderForm({
         <p className="text-xs text-gray-500 text-center mt-2">
           Approve tx:{" "}
           <a
-            href={`https://sepolia.etherscan.io/tx/${approveTxHash}`}
+            href={`${EXPLORER_URL}/tx/${approveTxHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-400/70 hover:text-blue-400 underline"
@@ -444,21 +454,16 @@ function SpinnerText({ text }: { text: string }) {
 function extractUserMessage(err: Error): string {
   const msg = err.message || "";
 
-  // User rejected in wallet
   if (msg.includes("User rejected") || msg.includes("user rejected")) {
     return "Transaction rejected in wallet";
   }
-  // Insufficient funds for gas
   if (msg.includes("insufficient funds")) {
     return "Insufficient ETH for gas fees";
   }
-  // Contract revert
   if (msg.includes("reverted")) {
-    // Try to extract revert reason
     const match = msg.match(/reason:\s*(.+?)(?:\n|$)/);
     return match ? `Contract reverted: ${match[1]}` : "Transaction reverted by contract";
   }
-  // Generic
   if (msg.length > 120) {
     return msg.slice(0, 120) + "…";
   }
