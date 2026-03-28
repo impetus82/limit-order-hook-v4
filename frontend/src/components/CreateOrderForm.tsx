@@ -103,16 +103,23 @@ export default function CreateOrderForm({
     }
   }, [amountIn, spendToken.decimals]);
 
-  // Trigger price is always stored as uint128 scaled to 1e18 in the contract
-  // (contract uses its own internal price representation)
+  // Trigger price scaling: contract stores raw_price * 1e18
+  // For currency0/currency1 with different decimals:
+  //   parseUnits decimals = 18 + quote_decimals - base_decimals
+  // WETH(18)/USDC(6) → 18 + 6 - 18 = 6
+  // "sell" direction: selling token0 (WETH), quote = token1 (USDC)
+  // "buy"  direction: buying token0 (WETH), quote = token1 (USDC)
+  // In both cases, the user enters "USDC per WETH", so the formula is the same.
+  const TRIGGER_PRICE_DECIMALS = 18 + TOKEN_1.decimals - TOKEN_0.decimals; // 6
+
   const parsedTriggerPrice = useMemo(() => {
     try {
       if (!triggerPrice || parseFloat(triggerPrice) <= 0) return null;
-      return parseUnits(triggerPrice, 18);
+      return parseUnits(triggerPrice, TRIGGER_PRICE_DECIMALS);
     } catch {
       return null;
     }
-  }, [triggerPrice]);
+  }, [triggerPrice, TRIGGER_PRICE_DECIMALS]);
 
   // Check if amount fits in uint96
   const amountExceedsUint96 = parsedAmount !== null && parsedAmount > UINT96_MAX;

@@ -7,8 +7,13 @@ import {
   useWriteContract,
   useWaitForTransactionReceipt,
 } from "wagmi";
-import { formatEther, zeroAddress, type Address } from "viem";
-import { LIMIT_ORDER_HOOK, TOKEN_TTA, TOKEN_TTB } from "@/config/contracts";
+import { formatUnits, zeroAddress, type Address } from "viem";
+import {
+  LIMIT_ORDER_HOOK,
+  TOKEN_0,
+  TOKEN_1,
+  EXPLORER_URL,
+} from "@/config/contracts";
 
 // ── Types ────────────────────────────────────────────────
 interface OrderData {
@@ -24,6 +29,9 @@ interface OrderData {
 }
 
 type OrderStatus = "active" | "filled" | "cancelled";
+
+// Trigger price decimals: 18 + quote_decimals - base_decimals
+const TRIGGER_PRICE_DECIMALS = 18 + TOKEN_1.decimals - TOKEN_0.decimals; // 6
 
 // ── OrderList (parent) ──────────────────────────────────
 export default function OrderList({
@@ -48,7 +56,6 @@ export default function OrderList({
     },
   });
 
-  // Re-fetch when refetchKey changes (order created or cancelled)
   useEffect(() => {
     if (address) refetchIds();
   }, [refetchKey, address, refetchIds]);
@@ -113,12 +120,10 @@ function OrderItem({
     query: { refetchInterval: 12_000 },
   });
 
-  // Re-fetch individual order when parent key changes
   useEffect(() => {
     refetchOrder();
   }, [refetchKey, refetchOrder]);
 
-  // ── Cancel TX flow ──────────────────────────────────
   const { data: cancelHash, writeContract: cancelOrder } = useWriteContract();
   const { isSuccess: cancelConfirmed } = useWaitForTransactionReceipt({
     hash: cancelHash,
@@ -126,7 +131,6 @@ function OrderItem({
 
   useEffect(() => {
     if (cancelConfirmed) {
-      // Refetch THIS order first, THEN notify parent
       refetchOrder().then(() => onCancelled());
     }
   }, [cancelConfirmed, refetchOrder, onCancelled]);
@@ -138,7 +142,6 @@ function OrderItem({
   const order = orderRaw as OrderData | undefined;
   if (!order) return null;
 
-  // Determine status
   const status: OrderStatus =
     order.creator === zeroAddress
       ? "cancelled"
@@ -146,16 +149,19 @@ function OrderItem({
         ? "filled"
         : "active";
 
-  // Direction & amounts
+  // Direction & amounts — use real token configs
   const isSell = order.zeroForOne;
-  const directionLabel = isSell ? "Sell TTA → TTB" : "Buy TTA ← TTB";
+  const directionLabel = isSell
+    ? `Sell ${TOKEN_0.symbol} → ${TOKEN_1.symbol}`
+    : `Buy ${TOKEN_0.symbol} ← ${TOKEN_1.symbol}`;
+  const inputToken = isSell ? TOKEN_0 : TOKEN_1;
+  const outputToken = isSell ? TOKEN_1 : TOKEN_0;
   const inputAmount = isSell ? order.amount0 : order.amount1;
   const outputAmount = isSell ? order.amount1 : order.amount0;
-  const inputSymbol = isSell ? TOKEN_TTA.symbol : TOKEN_TTB.symbol;
-  const outputSymbol = isSell ? TOKEN_TTB.symbol : TOKEN_TTA.symbol;
 
-  // Trigger price (stored as 1e18-scaled)
-  const triggerNum = Number(order.triggerPrice) / 1e18;
+  // Trigger price: stored as raw_price * 1e18, display as "USDC per WETH"
+  const triggerNum =
+    Number(order.triggerPrice) / 10 ** TRIGGER_PRICE_DECIMALS;
 
   const handleCancel = () => {
     cancelOrder({
@@ -175,42 +181,55 @@ function OrderItem({
           </span>
           <StatusBadge status={status} />
         </div>
-        <span className="text-xs text-gray-500">
-          {directionLabel}
-        </span>
+        <span className="text-xs text-gray-500">{directionLabel}</span>
       </div>
 
       {/* Details */}
-      <div className="grid grid-cols-2 gap-y-1.5 sm:gap-y-2 text-xs sm:text-sm">
+      <div className="grid grid-cols-2 gap-y-2 text-sm">
         <span className="text-gray-500">Input</span>
         <span className="text-right text-white font-mono">
-          {formatEther(inputAmount)} {inputSymbol}
+          {formatUnits(inputAmount, inputToken.decimals)} {inputToken.symbol}
         </span>
 
         {status === "filled" && outputAmount > 0n && (
           <>
             <span className="text-gray-500">Received</span>
             <span className="text-right text-emerald-400 font-mono">
-              {formatEther(outputAmount)} {outputSymbol}
+              {formatUnits(outputAmount, outputToken.decimals)}{" "}
+              {outputToken.symbol}
             </span>
           </>
         )}
 
         <span className="text-gray-500">Trigger</span>
         <span className="text-right text-gray-300 font-mono">
-          ≥ {triggerNum.toFixed(4)}
+          ≥ {triggerNum.toFixed(2)} {TOKEN_1.symbol}/{TOKEN_0.symbol}
         </span>
       </div>
 
-      {/* Cancel button */}
+      {/* Cancel button + explorer link */}
       {status === "active" && (
         <button
           onClick={handleCancel}
           disabled={!!cancelHash && !cancelConfirmed}
-          className="mt-3 w-full rounded-lg bg-red-900/30 border border-red-800/50 py-2.5 sm:py-2 text-sm text-red-400 hover:bg-red-900/50 transition-colors disabled:opacity-50"
+          className="mt-3 w-full rounded-lg bg-red-900/30 border border-red-800/50 py-2 text-sm text-red-400 hover:bg-red-900/50 transition-colors disabled:opacity-50"
         >
           {cancelHash && !cancelConfirmed ? "Cancelling…" : "Cancel Order"}
         </button>
+      )}
+
+      {/* Cancel tx link */}
+      {cancelHash && (
+        <p className="text-xs text-gray-500 text-center mt-2">
+          <a
+            href={`${EXPLORER_URL}/tx/${cancelHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400/70 hover:text-blue-400 underline"
+          >
+            View on BaseScan ↗
+          </a>
+        </p>
       )}
     </div>
   );
