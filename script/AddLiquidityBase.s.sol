@@ -8,6 +8,8 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
 /// @title AddLiquidityBase - Add micro liquidity to WETH/USDC pool on Base
 /// @notice Adds a tiny position ($5-10 worth) across the widest possible tick range
@@ -17,8 +19,8 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 ///   source .env
 ///   forge script script/AddLiquidityBase.s.sol:AddLiquidityBase \
 ///     --rpc-url $BASE_RPC_URL --broadcast \
-///     --slow --with-gas-price 100000000 -vvvv
-contract AddLiquidityBase is Script {
+///     --with-gas-price 100000000 -vvvv
+contract AddLiquidityBase is Script, IUnlockCallback {
     // ── Addresses (Base Mainnet) ────────────────────────────
     IPoolManager constant POOL_MANAGER =
         IPoolManager(0x498581fF718922c3f8e6A244956aF099B2652b2b);
@@ -32,14 +34,12 @@ contract AddLiquidityBase is Script {
     int24 constant TICK_SPACING = 60;
 
     // ── Liquidity range: widest possible, aligned to tickSpacing=60 ──
-    // Max usable ticks aligned to 60: ±887220
     int24 constant TICK_LOWER = -887220;
     int24 constant TICK_UPPER = 887220;
 
     // ── Liquidity amount ────────────────────────────────────
     // Very small: ~0.002 WETH ≈ $5-7 at ~$3000/ETH
-    // This creates a full-range position similar to Uniswap V2 style
-    int256 constant LIQUIDITY_DELTA = 1e15; // 1000000000000000 (~0.001 units of liquidity)
+    int256 constant LIQUIDITY_DELTA = 1e15;
 
     function run() external {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -88,8 +88,8 @@ contract AddLiquidityBase is Script {
     }
 
     /// @notice Callback from PoolManager.unlock()
-    /// @dev Called by PoolManager; must settle token debts via transfer
-    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+    /// @dev Called by PoolManager; must settle token debts via sync+transfer+settle
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         require(msg.sender == address(POOL_MANAGER), "Only PoolManager");
 
         (PoolKey memory poolKey, address deployer) = abi.decode(data, (PoolKey, address));
@@ -113,6 +113,7 @@ contract AddLiquidityBase is Script {
         // amount0 and amount1 in delta are negative = we owe the pool
         if (delta.amount0() < 0) {
             uint256 owed0 = uint256(uint128(-delta.amount0()));
+            POOL_MANAGER.sync(poolKey.currency0);
             IERC20(Currency.unwrap(poolKey.currency0)).transferFrom(
                 deployer, address(POOL_MANAGER), owed0
             );
@@ -120,6 +121,7 @@ contract AddLiquidityBase is Script {
         }
         if (delta.amount1() < 0) {
             uint256 owed1 = uint256(uint128(-delta.amount1()));
+            POOL_MANAGER.sync(poolKey.currency1);
             IERC20(Currency.unwrap(poolKey.currency1)).transferFrom(
                 deployer, address(POOL_MANAGER), owed1
             );
