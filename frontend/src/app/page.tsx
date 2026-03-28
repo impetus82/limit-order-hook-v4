@@ -63,14 +63,14 @@ export default function Home() {
         {/* Contract Status Card */}
         <div className="rounded-xl border border-gray-800 bg-gray-900 p-6">
           <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-4">
-            Contract Status — Sepolia
+            Contract Status — Base
           </h3>
 
           <div className="space-y-4">
             <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-1">
               <span className="text-gray-400 text-sm">Hook Address</span>
               <code className="text-xs sm:text-sm text-emerald-400 bg-gray-800 px-2 py-1 rounded break-all">
-                0x43BF...4040
+                0x02C7...0040
               </code>
             </div>
 
@@ -119,7 +119,7 @@ export default function Home() {
 
         {isConnected && (
           <p className="text-center text-xs text-gray-600">
-            Make sure you are on Sepolia testnet
+            Make sure you are on Base mainnet
           </p>
         )}
       </div>
