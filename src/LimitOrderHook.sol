@@ -661,6 +661,27 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
     ///      5. Deduct fee from output, take net tokens for creator + fee for hook
     ///      6. Mark order as filled
     /// @return success True if order was filled, false if skipped
+        // ═══════════════════════════════════════════════════════════════════
+    // PATCH: _executeOrder — settle by ACTUAL swap delta, not amountIn
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // ROOT CAUSE of CurrencyNotSettled:
+    //   When sqrtPriceLimitX96 causes a partial fill, the swap consumes
+    //   LESS input than amountIn. But the old code did:
+    //     safeTransfer(PM, amountIn)  ← full order size
+    //     settle()                     ← settles full amount
+    //   This over-settled input, leaving a positive delta on the hook.
+    //
+    // FIX: Use swapDelta to determine actual consumed amounts.
+    //   For zeroForOne=true:  actualInput = uint256(uint128(-swapDelta.amount0()))
+    //   For zeroForOne=false: actualInput = uint256(uint128(-swapDelta.amount1()))
+    //
+    // This also means partial fills are possible: only the consumed
+    // portion is settled, and the order could be partially filled.
+    // For simplicity, we still mark it as fully filled but only
+    // settle what was actually consumed.
+    // ═══════════════════════════════════════════════════════════════════
+
     function _executeOrder(
         PoolKey calldata poolKey,
         LimitOrder storage order,
@@ -690,8 +711,13 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
         // Settle input + Take output (with fee deduction)
         if (order.zeroForOne) {
+            // ── FIX: settle ACTUAL consumed amount, not full amountIn ──
+            // swapDelta.amount0() is negative (hook owes token0 to pool)
+            int128 deltaAmount0 = swapDelta.amount0();
+            uint256 actualInput = uint256(uint128(-deltaAmount0));
+
             poolManager.sync(poolKey.currency0);
-            IERC20(order.token0).safeTransfer(address(poolManager), uint256(amountIn));
+            IERC20(order.token0).safeTransfer(address(poolManager), actualInput);
             poolManager.settle();
 
             int128 deltaAmount1 = swapDelta.amount1();
@@ -719,11 +745,17 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 order.isFilled = true;
                 order.amount1 = netAmount.toUint96();
 
+                // Refund unconsumed input to creator
+                uint256 refund = uint256(amountIn) - actualInput;
+                if (refund > 0) {
+                    IERC20(order.token0).safeTransfer(order.creator, refund);
+                }
+
                 emit OrderExecutionFailed(orderId, "SlippageExceeded");
                 emit OrderFilled(
                     orderId,
                     order.creator,
-                    amountIn,
+                    uint96(actualInput),
                     netAmount.toUint96(),
                     sqrtPriceToUint128(currentSqrtPriceX96)
                 );
@@ -742,9 +774,20 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
             order.isFilled = true;
             order.amount1 = netAmount.toUint96();
+
+            // Refund unconsumed input to creator (if partial fill)
+            uint256 refund0 = uint256(amountIn) - actualInput;
+            if (refund0 > 0) {
+                IERC20(order.token0).safeTransfer(order.creator, refund0);
+            }
         } else {
+            // ── FIX: settle ACTUAL consumed amount, not full amountIn ──
+            // swapDelta.amount1() is negative (hook owes token1 to pool)
+            int128 deltaAmount1 = swapDelta.amount1();
+            uint256 actualInput = uint256(uint128(-deltaAmount1));
+
             poolManager.sync(poolKey.currency1);
-            IERC20(order.token1).safeTransfer(address(poolManager), uint256(amountIn));
+            IERC20(order.token1).safeTransfer(address(poolManager), actualInput);
             poolManager.settle();
 
             int128 deltaAmount0 = swapDelta.amount0();
@@ -772,11 +815,17 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
                 order.isFilled = true;
                 order.amount0 = netAmount.toUint96();
 
+                // Refund unconsumed input to creator
+                uint256 refund = uint256(amountIn) - actualInput;
+                if (refund > 0) {
+                    IERC20(order.token1).safeTransfer(order.creator, refund);
+                }
+
                 emit OrderExecutionFailed(orderId, "SlippageExceeded");
                 emit OrderFilled(
                     orderId,
                     order.creator,
-                    amountIn,
+                    uint96(actualInput),
                     netAmount.toUint96(),
                     sqrtPriceToUint128(currentSqrtPriceX96)
                 );
@@ -795,12 +844,18 @@ contract LimitOrderHook is BaseHook, ReentrancyGuard, Ownable {
 
             order.isFilled = true;
             order.amount0 = netAmount.toUint96();
+
+            // Refund unconsumed input to creator (if partial fill)
+            uint256 refund1 = uint256(amountIn) - actualInput;
+            if (refund1 > 0) {
+                IERC20(order.token1).safeTransfer(order.creator, refund1);
+            }
         }
 
         emit OrderFilled(
             orderId,
             order.creator,
-            amountIn,
+            uint96(order.zeroForOne ? uint256(uint128(-swapDelta.amount0())) : uint256(uint128(-swapDelta.amount1()))),
             order.zeroForOne ? order.amount1 : order.amount0,
             sqrtPriceToUint128(currentSqrtPriceX96)
         );

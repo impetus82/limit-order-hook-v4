@@ -2,7 +2,7 @@ import abiJson from "./abi.json";
 
 // ── Hook Contract (Base Mainnet) ────────────────────────
 export const LIMIT_ORDER_HOOK = {
-  address: "0x02C72A5E1125AD6f4B8D71E87af14BC8663b0040" as const,
+  address: "0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040" as const,
   abi: abiJson.abi,
 } as const;
 
@@ -39,7 +39,7 @@ export const STATE_VIEW = {
 // TODO: Replace with actual PoolId from SetupBase.s.sol output!
 // Run the script, copy the logged bytes32 value here.
 export const POOL_ID =
-  "0x9ab80bf349a3a10edc42141e23d29ab0cbaf02e7d43c75a3b30ebf0088faaa60" as const;
+  "0x46d245ea80a77f75aa95f84bdcea9a706f7af1e25168ce25102c268a93432148" as const;
 
 // ── Base Mainnet Pool Parameters ────────────────────────
 export const POOL_FEE = 3000;
