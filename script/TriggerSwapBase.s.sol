@@ -119,7 +119,7 @@ contract TriggerSwapBase is Script {
     uint24 constant POOL_FEE = 3000;
     int24 constant TICK_SPACING = 60;
 
-    uint256 constant SWAP_AMOUNT_USDC = 1e6; // 1 USDC
+    uint256 constant SWAP_AMOUNT_USDC = 5e5; // 1 USDC
 
     function run() external {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
