@@ -11,6 +11,17 @@ jobs:
     name: Foundry Tests
     runs-on: ubuntu-latest
 
+    env:
+      # Dummy values so deploy/interaction scripts compile in CI
+      # These are NEVER used for real transactions — CI only runs `forge test`
+      DEPLOYER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      SAFE_OWNER_ADDRESS: "0x0000000000000000000000000000000000000001"
+      BASE_RPC_URL: "https://mainnet.base.org"
+      SEPOLIA_RPC_URL: "https://ethereum-sepolia-rpc.publicnode.com"
+      ETHERSCAN_API_KEY: "dummy"
+      BASESCAN_API_KEY: "dummy"
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,27 +29,15 @@ jobs:
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: nightly
 
       - name: Show Foundry version
-        run: |
-          forge --version
+        run: forge --version
 
       - name: Run Forge build
-        run: |
-          forge build
+        run: forge build
         id: build
 
       - name: Run Forge tests
-        run: |
-          forge test -vv
+        run: forge test -vv
         id: test
-        env:
-          FOUNDRY_PROFILE: default
-
-      # Пропускаем coverage (не критично для MVP)
-      # - name: Run Forge coverage
-      #   run: |
-      #     forge coverage --report summary
-      #   continue-on-error: true
+          
