@@ -3,17 +3,17 @@
 import { useEffect } from "react";
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useWriteContract,
   useWaitForTransactionReceipt,
 } from "wagmi";
 import { formatUnits, zeroAddress, type Address } from "viem";
 import {
-  LIMIT_ORDER_HOOK,
-  TOKEN_0,
-  TOKEN_1,
-  EXPLORER_URL,
+  getChainContracts,
+  HOOK_ABI,
 } from "@/config/contracts";
+import { getTriggerPriceConfig } from "@/utils/price";
 
 // ── Types ────────────────────────────────────────────────
 interface OrderData {
@@ -30,9 +30,6 @@ interface OrderData {
 
 type OrderStatus = "active" | "filled" | "cancelled";
 
-// Trigger price decimals: 18 + quote_decimals - base_decimals
-const TRIGGER_PRICE_DECIMALS = 18 + TOKEN_1.decimals - TOKEN_0.decimals; // 6
-
 // ── OrderList (parent) ──────────────────────────────────
 export default function OrderList({
   refetchKey,
@@ -41,13 +38,17 @@ export default function OrderList({
   refetchKey: number;
 }) {
   const { address } = useAccount();
+  const chainId = useChainId();
+  const chain = getChainContracts(chainId);
+
+  const hookContract = { address: chain.hook, abi: HOOK_ABI } as const;
 
   const {
     data: orderIds,
     isLoading,
     refetch: refetchIds,
   } = useReadContract({
-    ...LIMIT_ORDER_HOOK,
+    ...hookContract,
     functionName: "getUserOrders",
     args: address ? [address] : undefined,
     query: {
@@ -89,6 +90,7 @@ export default function OrderList({
             <OrderItem
               key={id.toString()}
               orderId={id}
+              chainId={chainId}
               refetchKey={refetchKey}
               onCancelled={() => refetchIds()}
             />
@@ -102,19 +104,25 @@ export default function OrderList({
 // ── OrderItem (child) ───────────────────────────────────
 function OrderItem({
   orderId,
+  chainId,
   refetchKey,
   onCancelled,
 }: {
   orderId: bigint;
+  chainId: number;
   refetchKey: number;
   onCancelled: () => void;
 }) {
+  const chain = getChainContracts(chainId);
+  const hookContract = { address: chain.hook, abi: HOOK_ABI } as const;
+  const triggerPriceConfig = getTriggerPriceConfig(chain.wethIsCurrency0);
+
   const {
     data: orderRaw,
     isLoading,
     refetch: refetchOrder,
   } = useReadContract({
-    ...LIMIT_ORDER_HOOK,
+    ...hookContract,
     functionName: "getOrder",
     args: [orderId],
     query: { refetchInterval: 12_000 },
@@ -149,27 +157,55 @@ function OrderItem({
         ? "filled"
         : "active";
 
-  // Direction & amounts — use real token configs
-  const isSell = order.zeroForOne;
-  const directionLabel = isSell
-    ? `Sell ${TOKEN_0.symbol} → ${TOKEN_1.symbol}`
-    : `Buy ${TOKEN_0.symbol} ← ${TOKEN_1.symbol}`;
-  const inputToken = isSell ? TOKEN_0 : TOKEN_1;
-  const outputToken = isSell ? TOKEN_1 : TOKEN_0;
-  const inputAmount = isSell ? order.amount0 : order.amount1;
-  const outputAmount = isSell ? order.amount1 : order.amount0;
+  // ── Direction & amounts (always show as WETH/USDC semantic) ──
+  // On Base (wethIsCurrency0=true):
+  //   zeroForOne=true  → selling WETH (token0) → "Sell WETH → USDC"
+  //   zeroForOne=false → buying WETH (selling token1=USDC) → "Buy WETH ← USDC"
+  // On Unichain (wethIsCurrency0=false):
+  //   zeroForOne=true  → selling USDC (token0) → "Buy WETH ← USDC"
+  //   zeroForOne=false → selling WETH (token1) → "Sell WETH → USDC"
+  const isSellWeth = chain.wethIsCurrency0
+    ? order.zeroForOne    // Base: zeroForOne=true means sell WETH
+    : !order.zeroForOne;  // Unichain: zeroForOne=false means sell WETH
 
-  // Trigger price: stored as raw_price * 1e18, display as "USDC per WETH"
-  const triggerNum =
-    Number(order.triggerPrice) / 10 ** TRIGGER_PRICE_DECIMALS;
+  const directionLabel = isSellWeth
+    ? `Sell ${chain.weth.symbol} → ${chain.usdc.symbol}`
+    : `Buy ${chain.weth.symbol} ← ${chain.usdc.symbol}`;
+
+  const inputToken = isSellWeth ? chain.weth : chain.usdc;
+  const outputToken = isSellWeth ? chain.usdc : chain.weth;
+
+  // Adjust for Unichain: if not wethIsCurrency0, amounts are swapped
+  // amount0 is always in currency0 terms, amount1 in currency1 terms
+  // On Unichain: currency0=USDC, currency1=WETH
+  const displayInputAmount = chain.wethIsCurrency0
+    ? (isSellWeth ? order.amount0 : order.amount1)
+    : (isSellWeth ? order.amount1 : order.amount0);
+  const displayOutputAmount = chain.wethIsCurrency0
+    ? (isSellWeth ? order.amount1 : order.amount0)
+    : (isSellWeth ? order.amount0 : order.amount1);
+
+  // ── Trigger price display ─────────────────────────────
+  // Always show as "USDC per WETH"
+  let triggerDisplay: number;
+  if (triggerPriceConfig.needsInversion) {
+    // Unichain: stored as WETH/USDC, display as USDC/WETH
+    const storedNum = Number(order.triggerPrice) / 10 ** triggerPriceConfig.decimals;
+    triggerDisplay = storedNum > 0 ? 1 / storedNum : 0;
+  } else {
+    // Base: stored as USDC/WETH
+    triggerDisplay = Number(order.triggerPrice) / 10 ** triggerPriceConfig.decimals;
+  }
 
   const handleCancel = () => {
     cancelOrder({
-      ...LIMIT_ORDER_HOOK,
+      ...hookContract,
       functionName: "cancelOrder",
       args: [orderId],
     });
   };
+
+  const explorerName = chain.chainLabel === "BASE" ? "BaseScan" : "Uniscan";
 
   return (
     <div className="rounded-lg border border-gray-700 bg-gray-800/50 p-4">
@@ -188,14 +224,14 @@ function OrderItem({
       <div className="grid grid-cols-2 gap-y-2 text-sm">
         <span className="text-gray-500">Input</span>
         <span className="text-right text-white font-mono">
-          {formatUnits(inputAmount, inputToken.decimals)} {inputToken.symbol}
+          {formatUnits(displayInputAmount, inputToken.decimals)} {inputToken.symbol}
         </span>
 
-        {status === "filled" && outputAmount > 0n && (
+        {status === "filled" && displayOutputAmount > 0n && (
           <>
             <span className="text-gray-500">Received</span>
             <span className="text-right text-emerald-400 font-mono">
-              {formatUnits(outputAmount, outputToken.decimals)}{" "}
+              {formatUnits(displayOutputAmount, outputToken.decimals)}{" "}
               {outputToken.symbol}
             </span>
           </>
@@ -203,11 +239,11 @@ function OrderItem({
 
         <span className="text-gray-500">Trigger</span>
         <span className="text-right text-gray-300 font-mono">
-          ≥ {triggerNum.toFixed(2)} {TOKEN_1.symbol}/{TOKEN_0.symbol}
+          ≥ {triggerDisplay.toFixed(2)} USDC/WETH
         </span>
       </div>
 
-      {/* Cancel button + explorer link */}
+      {/* Cancel button */}
       {status === "active" && (
         <button
           onClick={handleCancel}
@@ -222,12 +258,12 @@ function OrderItem({
       {cancelHash && (
         <p className="text-xs text-gray-500 text-center mt-2">
           <a
-            href={`${EXPLORER_URL}/tx/${cancelHash}`}
+            href={`${chain.explorerUrl}/tx/${cancelHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-400/70 hover:text-blue-400 underline"
           >
-            View on BaseScan ↗
+            View on {explorerName} ↗
           </a>
         </p>
       )}

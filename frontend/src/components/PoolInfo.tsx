@@ -1,7 +1,10 @@
 "use client";
 
-import { useReadContract } from "wagmi";
-import { STATE_VIEW, POOL_ID } from "@/config/contracts";
+import { useReadContract, useChainId } from "wagmi";
+import {
+  getChainContracts,
+  STATE_VIEW_ABI,
+} from "@/config/contracts";
 import {
   sqrtPriceX96ToPrice,
   formatPrice,
@@ -16,15 +19,19 @@ function PriceSkeleton() {
 }
 
 export default function PoolInfo() {
+  const chainId = useChainId();
+  const chain = getChainContracts(chainId);
+
   const {
     data: slot0,
     isLoading,
     isError,
     error,
   } = useReadContract({
-    ...STATE_VIEW,
+    address: chain.stateView,
+    abi: STATE_VIEW_ABI,
     functionName: "getSlot0",
-    args: [POOL_ID],
+    args: [chain.poolId],
     query: { refetchInterval: 12_000 },
   });
 
@@ -73,8 +80,11 @@ export default function PoolInfo() {
   const sqrtPriceX96 = slot0?.[0] as bigint | undefined;
   const tick = slot0?.[1] as number | undefined;
 
+  // Always returns USDC per WETH regardless of chain
   const priceRaw =
-    sqrtPriceX96 !== undefined ? sqrtPriceX96ToPrice(sqrtPriceX96) : 0;
+    sqrtPriceX96 !== undefined
+      ? sqrtPriceX96ToPrice(sqrtPriceX96, chain.wethIsCurrency0)
+      : 0;
 
   const priceForward = formatPrice(priceRaw);
   const priceInverse = formatPrice(invertPrice(priceRaw));
@@ -89,7 +99,9 @@ export default function PoolInfo() {
         <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
           Pool Price — WETH / USDC
         </h3>
-        <span className="text-[10px] text-gray-600 font-mono">BASE • LIVE</span>
+        <span className="text-[10px] text-gray-600 font-mono">
+          {chain.chainLabel} • LIVE
+        </span>
       </div>
 
       {isPoolEmpty ? (

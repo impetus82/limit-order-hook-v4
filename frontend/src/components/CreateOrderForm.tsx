@@ -3,19 +3,21 @@
 import { useState, useMemo, useEffect } from "react";
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useWriteContract,
   useWaitForTransactionReceipt,
 } from "wagmi";
 import { parseUnits, formatUnits, type Address } from "viem";
 import {
-  LIMIT_ORDER_HOOK,
+  getChainContracts,
+  getSortedTokens,
+  HOOK_ABI,
   ERC20_ABI,
-  TOKEN_0,
-  TOKEN_1,
-  POOL_KEY,
-  EXPLORER_URL,
+  POOL_FEE,
+  TICK_SPACING,
 } from "@/config/contracts";
+import { getTriggerPriceConfig } from "@/utils/price";
 
 // ── Types ───────────────────────────────────────────────
 type OrderDirection = "sell" | "buy";
@@ -32,6 +34,9 @@ export default function CreateOrderForm({
   onOrderCreated?: () => void;
 }) {
   const { address, isConnected } = useAccount();
+  const chainId = useChainId();
+  const chain = getChainContracts(chainId);
+  const { currency0, currency1 } = getSortedTokens(chainId);
 
   // Form state
   const [direction, setDirection] = useState<OrderDirection>("sell");
@@ -40,13 +45,20 @@ export default function CreateOrderForm({
   const [txStep, setTxStep] = useState<TxStep>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  // Derived: which token are we spending?
-  // currency0 = WETH, currency1 = USDC
-  // "sell" = sell WETH for USDC (zeroForOne=true)
-  // "buy"  = buy WETH with USDC (zeroForOne=false)
-  const spendToken = direction === "sell" ? TOKEN_0 : TOKEN_1;
-  const receiveToken = direction === "sell" ? TOKEN_1 : TOKEN_0;
-  const zeroForOne = direction === "sell";
+  // ── Token mapping (UI-semantic, not sort-order) ───────
+  // "sell" = sell WETH for USDC → zeroForOne depends on sort order
+  // "buy"  = buy WETH with USDC → opposite direction
+  //
+  // On Base  (wethIsCurrency0=true):  sell WETH = zeroForOne=true
+  // On Unichain (wethIsCurrency0=false): sell WETH = zeroForOne=false (selling currency1)
+  const zeroForOne = chain.wethIsCurrency0
+    ? direction === "sell"  // Base: sell WETH (cur0) → true
+    : direction === "buy";  // Unichain: buy WETH means sell USDC (cur0) → true
+
+  const spendToken = direction === "sell" ? chain.weth : chain.usdc;
+
+  // ── Hook contract reference ───────────────────────────
+  const hookContract = { address: chain.hook, abi: HOOK_ABI } as const;
 
   // ── Read: user balance ────────────────────────────────
   const { data: userBalance } = useReadContract({
@@ -62,7 +74,7 @@ export default function CreateOrderForm({
     address: spendToken.address,
     abi: ERC20_ABI,
     functionName: "allowance",
-    args: address ? [address, LIMIT_ORDER_HOOK.address] : undefined,
+    args: address ? [address, chain.hook] : undefined,
     query: { enabled: !!address },
   });
 
@@ -93,7 +105,6 @@ export default function CreateOrderForm({
     });
 
   // ── Parsed amounts (DECIMAL-AWARE) ────────────────────
-  // KEY CHANGE: Use parseUnits with token-specific decimals instead of parseEther
   const parsedAmount = useMemo(() => {
     try {
       if (!amountIn || parseFloat(amountIn) <= 0) return null;
@@ -103,23 +114,33 @@ export default function CreateOrderForm({
     }
   }, [amountIn, spendToken.decimals]);
 
-  // Trigger price scaling: contract stores raw_price * 1e18
-  // For currency0/currency1 with different decimals:
-  //   parseUnits decimals = 18 + quote_decimals - base_decimals
-  // WETH(18)/USDC(6) → 18 + 6 - 18 = 6
-  // "sell" direction: selling token0 (WETH), quote = token1 (USDC)
-  // "buy"  direction: buying token0 (WETH), quote = token1 (USDC)
-  // In both cases, the user enters "USDC per WETH", so the formula is the same.
-  const TRIGGER_PRICE_DECIMALS = 18 + TOKEN_1.decimals - TOKEN_0.decimals; // 6
+  // ── Trigger price parsing ─────────────────────────────
+  // User ALWAYS enters "USDC per WETH" in the form.
+  // On Base:     stored as-is (currency1/currency0 = USDC/WETH)
+  // On Unichain: must INVERT because contract stores currency1/currency0 = WETH/USDC
+  const triggerPriceConfig = getTriggerPriceConfig(chain.wethIsCurrency0);
 
   const parsedTriggerPrice = useMemo(() => {
     try {
       if (!triggerPrice || parseFloat(triggerPrice) <= 0) return null;
-      return parseUnits(triggerPrice, TRIGGER_PRICE_DECIMALS);
+
+      if (triggerPriceConfig.needsInversion) {
+        // Unichain: user enters "3500" (USDC/WETH), contract needs WETH/USDC
+        // WETH/USDC = 1/3500 ≈ 0.000285714...
+        // Store as parseUnits("0.000285714...", 30)
+        const userPrice = parseFloat(triggerPrice);
+        const invertedPrice = 1 / userPrice;
+        // Use high precision string for parseUnits
+        const invertedStr = invertedPrice.toFixed(24); // enough precision for 30 decimals
+        return parseUnits(invertedStr, triggerPriceConfig.decimals);
+      } else {
+        // Base: straightforward
+        return parseUnits(triggerPrice, triggerPriceConfig.decimals);
+      }
     } catch {
       return null;
     }
-  }, [triggerPrice, TRIGGER_PRICE_DECIMALS]);
+  }, [triggerPrice, triggerPriceConfig]);
 
   // Check if amount fits in uint96
   const amountExceedsUint96 = parsedAmount !== null && parsedAmount > UINT96_MAX;
@@ -189,7 +210,7 @@ export default function CreateOrderForm({
           address: spendToken.address,
           abi: ERC20_ABI,
           functionName: "approve",
-          args: [LIMIT_ORDER_HOOK.address, parsedAmount],
+          args: [chain.hook, parsedAmount],
         },
         {
           onSuccess: () => setTxStep("waitApprove"),
@@ -208,16 +229,16 @@ export default function CreateOrderForm({
     setTxStep("placing");
 
     const poolKeyTuple = {
-      currency0: POOL_KEY.currency0 as Address,
-      currency1: POOL_KEY.currency1 as Address,
-      fee: POOL_KEY.fee,
-      tickSpacing: POOL_KEY.tickSpacing,
-      hooks: POOL_KEY.hooks as Address,
+      currency0: currency0.address as Address,
+      currency1: currency1.address as Address,
+      fee: POOL_FEE,
+      tickSpacing: TICK_SPACING,
+      hooks: chain.hook as Address,
     };
 
     writeCreate(
       {
-        ...LIMIT_ORDER_HOOK,
+        ...hookContract,
         functionName: "createLimitOrder",
         args: [poolKeyTuple, zeroForOne, parsedAmount, parsedTriggerPrice],
       },
@@ -244,6 +265,9 @@ export default function CreateOrderForm({
     parsedTriggerPrice !== null &&
     !amountExceedsUint96 &&
     txStep === "idle";
+
+  // ── Explorer label ────────────────────────────────────
+  const explorerName = chain.chainLabel === "BASE" ? "BaseScan" : "Uniscan";
 
   // ── Render ────────────────────────────────────────────
   return (
@@ -360,12 +384,12 @@ export default function CreateOrderForm({
             </p>
             {createTxHash && (
               <a
-                href={`${EXPLORER_URL}/tx/${createTxHash}`}
+                href={`${chain.explorerUrl}/tx/${createTxHash}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-xs text-emerald-500/70 hover:text-emerald-400 underline mt-1 inline-block"
               >
-                View on BaseScan ↗
+                View on {explorerName} ↗
               </a>
             )}
           </div>
@@ -399,7 +423,7 @@ export default function CreateOrderForm({
         <p className="text-xs text-gray-500 text-center mt-2">
           Approve tx:{" "}
           <a
-            href={`${EXPLORER_URL}/tx/${approveTxHash}`}
+            href={`${chain.explorerUrl}/tx/${approveTxHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-blue-400/70 hover:text-blue-400 underline"
