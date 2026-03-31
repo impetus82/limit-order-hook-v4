@@ -1,72 +1,146 @@
 import abiJson from "./abi.json";
 
-// ── Hook Contract (Base Mainnet) ────────────────────────
-export const LIMIT_ORDER_HOOK = {
-  address: "0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040" as const,
-  abi: abiJson.abi,
-} as const;
+// ── ABI (shared across all chains) ──────────────────────
+export const HOOK_ABI = abiJson.abi;
 
-// ── Uniswap V4 StateView (Base Mainnet) ─────────────────
-// StateView is a dedicated offchain-read contract that wraps
-// PoolManager's extsload calls via StateLibrary.
-// Source: https://docs.uniswap.org/contracts/v4/deployments
-export const STATE_VIEW = {
-  address: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71" as const,
-  abi: [
-    {
-      name: "getSlot0",
-      type: "function",
-      stateMutability: "view",
-      inputs: [{ name: "poolId", type: "bytes32" }],
-      outputs: [
-        { name: "sqrtPriceX96", type: "uint160" },
-        { name: "tick", type: "int24" },
-        { name: "protocolFee", type: "uint24" },
-        { name: "lpFee", type: "uint24" },
-      ],
+// ── StateView ABI (shared) ──────────────────────────────
+export const STATE_VIEW_ABI = [
+  {
+    name: "getSlot0",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [
+      { name: "sqrtPriceX96", type: "uint160" },
+      { name: "tick", type: "int24" },
+      { name: "protocolFee", type: "uint24" },
+      { name: "lpFee", type: "uint24" },
+    ],
+  },
+  {
+    name: "getLiquidity",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [{ name: "liquidity", type: "uint128" }],
+  },
+] as const;
+
+// ── Per-chain contract addresses ────────────────────────
+// After deploying to Unichain, fill in the HOOK and POOL_ID values.
+// NOTE on token sorting:
+//   Base:     WETH (0x4200...) < USDC (0x8335...) → currency0=WETH, currency1=USDC
+//   Unichain: USDC (0x078d...) < WETH (0x4200...) → currency0=USDC, currency1=WETH
+//   This affects price interpretation! See getChainContracts().tokenOrder
+
+type ChainContracts = {
+  hook: `0x${string}`;
+  stateView: `0x${string}`;
+  poolManager: `0x${string}`;
+  weth: { address: `0x${string}`; symbol: string; name: string; decimals: number };
+  usdc: { address: `0x${string}`; symbol: string; name: string; decimals: number };
+  poolId: `0x${string}`;
+  explorerUrl: string;
+  chainLabel: string;
+  // true means currency0=WETH (like Base), false means currency0=USDC (like Unichain)
+  wethIsCurrency0: boolean;
+};
+
+const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
+  // ── Base Mainnet (8453) ─────────────────────────────
+  8453: {
+    hook: "0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040",
+    stateView: "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71",
+    poolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
+    weth: {
+      address: "0x4200000000000000000000000000000000000006",
+      symbol: "WETH",
+      name: "Wrapped Ether",
+      decimals: 18,
     },
-    {
-      name: "getLiquidity",
-      type: "function",
-      stateMutability: "view",
-      inputs: [{ name: "poolId", type: "bytes32" }],
-      outputs: [{ name: "liquidity", type: "uint128" }],
+    usdc: {
+      address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      symbol: "USDC",
+      name: "USD Coin",
+      decimals: 6,
     },
-  ] as const,
-} as const;
+    poolId: "0x46d245ea80a77f75aa95f84bdcea9a706f7af1e25168ce25102c268a93432148",
+    explorerUrl: "https://basescan.org",
+    chainLabel: "BASE",
+    wethIsCurrency0: true, // WETH (0x4200) < USDC (0x8335)
+  },
 
-// ── Pool ID ─────────────────────────────────────────────
-// TODO: Replace with actual PoolId from SetupBase.s.sol output!
-// Run the script, copy the logged bytes32 value here.
-export const POOL_ID =
-  "0x46d245ea80a77f75aa95f84bdcea9a706f7af1e25168ce25102c268a93432148" as const;
+  // ── Unichain Mainnet (130) ──────────────────────────
+  130: {
+    hook: "0x9138f699f5f5ab19ed8271c3b143b229781a8040",
+    stateView: "0x86e8631a016f9068c3f085faf484ee3f5fdee8f2",
+    poolManager: "0x1F98400000000000000000000000000000000004",
+    weth: {
+      address: "0x4200000000000000000000000000000000000006",
+      symbol: "WETH",
+      name: "Wrapped Ether",
+      decimals: 18,
+    },
+    usdc: {
+      address: "0x078d782b760474a361dda0af3839290b0ef57ad6",
+      symbol: "USDC",
+      name: "USD Coin",
+      decimals: 6,
+    },
+    poolId: "0x0c8e31465c4023ec1f6c0becd753cf2a955051b2c6c502d1adb204d2595331fc",
+    explorerUrl: "https://uniscan.xyz",
+    chainLabel: "UNICHAIN",
+    wethIsCurrency0: false, // USDC (0x078d) < WETH (0x4200)
+  },
+};
 
-// ── Base Mainnet Pool Parameters ────────────────────────
+// ── Default chain (Base) ────────────────────────────────
+const DEFAULT_CHAIN_ID = 8453;
+
+// ── Getter: returns contracts for a given chainId ───────
+export function getChainContracts(chainId: number | undefined): ChainContracts {
+  return CHAIN_CONTRACTS[chainId ?? DEFAULT_CHAIN_ID] ?? CHAIN_CONTRACTS[DEFAULT_CHAIN_ID];
+}
+
+// ── Helper: get currency0/currency1 in Uniswap sort order ─
+export function getSortedTokens(chainId: number | undefined) {
+  const c = getChainContracts(chainId);
+  if (c.wethIsCurrency0) {
+    return { currency0: c.weth, currency1: c.usdc };
+  }
+  return { currency0: c.usdc, currency1: c.weth };
+}
+
+// ── Pool parameters (same on both chains) ───────────────
 export const POOL_FEE = 3000;
 export const TICK_SPACING = 60;
 
-// ── Real Tokens (Base Mainnet) ──────────────────────────
-// WETH: 0x4200... < USDC: 0x8335...  →  currency0 = WETH, currency1 = USDC
-export const TOKEN_WETH = {
-  address: "0x4200000000000000000000000000000000000006" as const,
-  symbol: "WETH",
-  name: "Wrapped Ether",
-  decimals: 18,
+// ── Backward-compatible exports (Base defaults) ─────────
+// Components that haven't migrated to getChainContracts() yet
+// will continue to work with Base addresses.
+const baseContracts = CHAIN_CONTRACTS[DEFAULT_CHAIN_ID];
+
+export const LIMIT_ORDER_HOOK = {
+  address: baseContracts.hook,
+  abi: HOOK_ABI,
 } as const;
 
-export const TOKEN_USDC = {
-  address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const,
-  symbol: "USDC",
-  name: "USD Coin",
-  decimals: 6,
+export const STATE_VIEW = {
+  address: baseContracts.stateView,
+  abi: STATE_VIEW_ABI,
 } as const;
 
-// Aliases matching old TTA/TTB pattern (currency0 = WETH, currency1 = USDC)
+export const POOL_ID = baseContracts.poolId;
+
+export const TOKEN_WETH = baseContracts.weth;
+export const TOKEN_USDC = baseContracts.usdc;
 export const TOKEN_0 = TOKEN_WETH;
 export const TOKEN_1 = TOKEN_USDC;
+export const TOKEN_TTA = TOKEN_WETH;
+export const TOKEN_TTB = TOKEN_USDC;
 
-// currency0 < currency1 (sorted by address for Uniswap V4 PoolKey)
-// WETH (0x4200...) < USDC (0x8335...) ✅
+export const EXPLORER_URL = baseContracts.explorerUrl;
+
 export const POOL_KEY = {
   currency0: TOKEN_WETH.address,
   currency1: TOKEN_USDC.address,
@@ -75,7 +149,7 @@ export const POOL_KEY = {
   hooks: LIMIT_ORDER_HOOK.address,
 } as const;
 
-// ── Minimal ERC20 ABI (approve + allowance + balanceOf) ─
+// ── Minimal ERC20 ABI ───────────────────────────────────
 export const ERC20_ABI = [
   {
     name: "approve",
@@ -120,10 +194,5 @@ export const ERC20_ABI = [
   },
 ] as const;
 
-// ── Legacy aliases for backward compatibility ───────────
-// Components that import TOKEN_TTA/TOKEN_TTB will still work
-export const TOKEN_TTA = TOKEN_WETH;
-export const TOKEN_TTB = TOKEN_USDC;
-
-// ── Block explorer base URL ─────────────────────────────
-export const EXPLORER_URL = "https://basescan.org";
+// ── Supported chain IDs ─────────────────────────────────
+export const SUPPORTED_CHAIN_IDS = Object.keys(CHAIN_CONTRACTS).map(Number);
