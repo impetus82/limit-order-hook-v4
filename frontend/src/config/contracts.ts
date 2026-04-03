@@ -27,11 +27,10 @@ export const STATE_VIEW_ABI = [
 ] as const;
 
 // ── Per-chain contract addresses ────────────────────────
-// After deploying to Unichain, fill in the HOOK and POOL_ID values.
 // NOTE on token sorting:
 //   Base:     WETH (0x4200...) < USDC (0x8335...) → currency0=WETH, currency1=USDC
 //   Unichain: USDC (0x078d...) < WETH (0x4200...) → currency0=USDC, currency1=WETH
-//   This affects price interpretation! See getChainContracts().tokenOrder
+//   This affects price interpretation! See getChainContracts().wethIsCurrency0
 
 type ChainContracts = {
   hook: `0x${string}`;
@@ -67,7 +66,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
     poolId: "0x46d245ea80a77f75aa95f84bdcea9a706f7af1e25168ce25102c268a93432148",
     explorerUrl: "https://basescan.org",
     chainLabel: "BASE",
-    wethIsCurrency0: true, // WETH (0x4200) < USDC (0x8335)
+    wethIsCurrency0: true,
   },
 
   // ── Unichain Mainnet (130) ──────────────────────────
@@ -90,7 +89,7 @@ const CHAIN_CONTRACTS: Record<number, ChainContracts> = {
     poolId: "0x0c8e31465c4023ec1f6c0becd753cf2a955051b2c6c502d1adb204d2595331fc",
     explorerUrl: "https://uniscan.xyz",
     chainLabel: "UNICHAIN",
-    wethIsCurrency0: false, // USDC (0x078d) < WETH (0x4200)
+    wethIsCurrency0: false,
   },
 };
 
@@ -114,40 +113,6 @@ export function getSortedTokens(chainId: number | undefined) {
 // ── Pool parameters (same on both chains) ───────────────
 export const POOL_FEE = 3000;
 export const TICK_SPACING = 60;
-
-// ── Backward-compatible exports (Base defaults) ─────────
-// Components that haven't migrated to getChainContracts() yet
-// will continue to work with Base addresses.
-const baseContracts = CHAIN_CONTRACTS[DEFAULT_CHAIN_ID];
-
-export const LIMIT_ORDER_HOOK = {
-  address: baseContracts.hook,
-  abi: HOOK_ABI,
-} as const;
-
-export const STATE_VIEW = {
-  address: baseContracts.stateView,
-  abi: STATE_VIEW_ABI,
-} as const;
-
-export const POOL_ID = baseContracts.poolId;
-
-export const TOKEN_WETH = baseContracts.weth;
-export const TOKEN_USDC = baseContracts.usdc;
-export const TOKEN_0 = TOKEN_WETH;
-export const TOKEN_1 = TOKEN_USDC;
-export const TOKEN_TTA = TOKEN_WETH;
-export const TOKEN_TTB = TOKEN_USDC;
-
-export const EXPLORER_URL = baseContracts.explorerUrl;
-
-export const POOL_KEY = {
-  currency0: TOKEN_WETH.address,
-  currency1: TOKEN_USDC.address,
-  fee: POOL_FEE,
-  tickSpacing: TICK_SPACING,
-  hooks: LIMIT_ORDER_HOOK.address,
-} as const;
 
 // ── Minimal ERC20 ABI ───────────────────────────────────
 export const ERC20_ABI = [

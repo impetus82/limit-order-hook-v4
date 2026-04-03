@@ -105,9 +105,9 @@ contract AddLiquidityUnichain is Script {
         IPoolManager(0x1F98400000000000000000000000000000000004);
 
     // Unichain: USDC sorts before WETH → currency0 = USDC, currency1 = WETH
-    address constant USDC = 0x078d782b760474a361dda0af3839290b0ef57ad6;
+    address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;
     address constant WETH = 0x4200000000000000000000000000000000000006;
-    address constant HOOK = 0x9138f699f5f5ab19ed8271c3b143b229781a8040;
+    address constant HOOK = 0x9138F699F5F5AB19ed8271c3B143B229781A8040;
 
     // ── Pool parameters (must match pool initialization) ────
     uint24 constant POOL_FEE = 0; // Dynamic fee via hook
