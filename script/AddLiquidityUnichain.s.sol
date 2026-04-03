@@ -135,7 +135,7 @@ contract AddLiquidityUnichain is Script {
         console2.log("USDC balance:", usdcBal);
         console2.log("WETH balance:", wethBal);
 
-        require(usdcBal >= 1e6, "Need at least 1 USDC");
+        require(usdcBal >= 5e5, "Need at least 0.5 USDC");
         require(wethBal >= 0.0002 ether, "Need at least 0.0002 WETH");
 
         vm.startBroadcast(deployerPk);
