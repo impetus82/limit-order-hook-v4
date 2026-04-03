@@ -120,7 +120,7 @@ Both mainnet deployments are source-verified:
 - **Base:** [BaseScan](https://basescan.org/address/0x45d971BdE51dd5E109036aB70a4E0b0eD2Dc4040#code)
 - **Unichain:** Verified via Etherscan V2 API (`chainid=130`)
 
-E2E order execution confirmed on Base (order #0, `isFilled = true`). Unichain E2E in progress.
+E2E order execution confirmed on both chains: Base (order #0) and Unichain (orders #0, #1), all `isFilled = true`.
 
 ---
 
